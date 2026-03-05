@@ -1,0 +1,240 @@
+﻿package com.andoni.convertidor.ui.screens
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import coil.decode.VideoFrameDecoder
+import coil.request.ImageRequest
+import coil.size.Size
+import com.andoni.convertidor.data.VideoItem
+import com.andoni.convertidor.data.VideoRepository
+import com.andoni.convertidor.data.extension
+import com.andoni.convertidor.data.formattedDuration
+import com.andoni.convertidor.data.formattedSize
+import kotlinx.coroutines.launch
+
+private enum class SortOrder(val label: String) {
+    DATE_DESC("MÃ¡s nuevo primero"),
+    DATE_ASC("MÃ¡s antiguo primero"),
+    NAME_ASC("Nombre A â†’ Z"),
+    NAME_DESC("Nombre Z â†’ A")
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun VideoListScreen(onVideoClick: (Long) -> Unit) {
+    val context      = LocalContext.current
+    val repository   = remember { VideoRepository(context) }
+    var videos       by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
+    var isLoading    by remember { mutableStateOf(true) }
+    var sortOrder    by remember { mutableStateOf(SortOrder.DATE_DESC) }
+    var showSortMenu by remember { mutableStateOf(false) }
+    val scope        = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        scope.launch {
+            videos    = repository.getAllVideos()
+            isLoading = false
+        }
+    }
+
+    val sortedVideos = remember(videos, sortOrder) {
+        when (sortOrder) {
+            SortOrder.DATE_DESC -> videos.sortedByDescending { it.dateAdded }
+            SortOrder.DATE_ASC  -> videos.sortedBy { it.dateAdded }
+            SortOrder.NAME_ASC  -> videos.sortedBy { it.name.lowercase() }
+            SortOrder.NAME_DESC -> videos.sortedByDescending { it.name.lowercase() }
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Column {
+                        Text("VideoConvert", fontWeight = FontWeight.Bold)
+                        Text(
+                            "${videos.size} videos",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                        )
+                    }
+                },
+                actions = {
+                    Box {
+                        IconButton(onClick = { showSortMenu = true }) {
+                            Icon(Icons.Default.Sort, contentDescription = "Ordenar")
+                        }
+                        DropdownMenu(
+                            expanded = showSortMenu,
+                            onDismissRequest = { showSortMenu = false }
+                        ) {
+                            SortOrder.entries.forEach { order ->
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            if (sortOrder == order) {
+                                                Icon(
+                                                    Icons.Default.Check,
+                                                    contentDescription = null,
+                                                    tint = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.size(18.dp)
+                                                )
+                                            } else {
+                                                Spacer(Modifier.size(18.dp))
+                                            }
+                                            Text(order.label)
+                                        }
+                                    },
+                                    onClick = {
+                                        sortOrder = order
+                                        showSortMenu = false
+                                    }
+                                )
+                            }
+                        }
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.primaryContainer
+                )
+            )
+        }
+    ) { padding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+        ) {
+            when {
+                isLoading -> CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+
+                sortedVideos.isEmpty() -> Column(
+                    modifier = Modifier.align(Alignment.Center),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text("No se encontraron videos", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "AsegÃºrate de haber concedido el permiso de galerÃ­a",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+
+                else -> LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items(sortedVideos, key = { it.id }) { video ->
+                        VideoListItem(video = video, onClick = { onVideoClick(video.id) })
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VideoListItem(video: VideoItem, onClick: () -> Unit) {
+    val context = LocalContext.current
+    Card(
+        modifier  = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Row(
+            modifier  = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            // Miniatura del video
+            Box(
+                modifier = Modifier
+                    .size(88.dp, 66.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center
+            ) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(video.uri)
+                        .decoderFactory(VideoFrameDecoder.Factory())
+                        .size(Size(176, 132))
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                Text(
+                    text       = video.name,
+                    style      = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines   = 2,
+                    overflow   = TextOverflow.Ellipsis
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment     = Alignment.CenterVertically
+                ) {
+                    FormatBadge(video.extension.uppercase().ifBlank { "?" })
+                    Text(
+                        video.formattedDuration,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        video.formattedSize,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FormatBadge(format: String) {
+    Surface(
+        shape = RoundedCornerShape(4.dp),
+        color = MaterialTheme.colorScheme.secondaryContainer
+    ) {
+        Text(
+            text       = format,
+            modifier   = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+            style      = MaterialTheme.typography.labelSmall,
+            color      = MaterialTheme.colorScheme.onSecondaryContainer,
+            fontWeight = FontWeight.Bold
+        )
+    }
+}
