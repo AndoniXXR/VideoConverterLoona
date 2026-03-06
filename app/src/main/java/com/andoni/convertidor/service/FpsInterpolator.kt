@@ -242,17 +242,36 @@ object FpsInterpolator {
     )
 
     private fun readVideoMeta(context: Context, uri: Uri): VideoMeta {
+        // Leer FPS del track format (MediaExtractor) — mucho más fiable que METADATA_KEY_CAPTURE_FRAMERATE
+        var extractorFps = -1
+        try {
+            val ex = MediaExtractor()
+            ex.setDataSource(context, uri, null)
+            for (i in 0 until ex.trackCount) {
+                val fmt = ex.getTrackFormat(i)
+                if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                    if (fmt.containsKey(MediaFormat.KEY_FRAME_RATE))
+                        extractorFps = fmt.getInteger(MediaFormat.KEY_FRAME_RATE)
+                    break
+                }
+            }
+            ex.release()
+        } catch (_: Exception) {}
+
         val r = MediaMetadataRetriever()
         return try {
             r.setDataSource(context, uri)
-            val fps = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-                ?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 } ?: 30
+            val fps = extractorFps.takeIf { it in 1..240 }
+                ?: r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                    ?.toFloatOrNull()?.toInt()?.takeIf { it in 1..240 }
+                ?: 30
             val w   = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
                 ?.toIntOrNull()?.takeIf { it > 0 } ?: 1280
             val h   = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                 ?.toIntOrNull()?.takeIf { it > 0 } ?: 720
             val ms  = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 ?.toLongOrNull() ?: 0L
+            Log.d(TAG, "readVideoMeta: extractorFps=$extractorFps, final fps=$fps, ${w}x${h}, ${ms}ms")
             VideoMeta(fps, w, h, ms)
         } catch (_: Exception) {
             VideoMeta(30, 1280, 720, 0L)
@@ -307,25 +326,50 @@ object FpsInterpolator {
 
     private fun imageToMat(image: android.media.Image, targetW: Int, targetH: Int): Mat? {
         return try {
+            val w = image.width
+            val h = image.height
             val yPlane = image.planes[0]
             val uPlane = image.planes[1]
             val vPlane = image.planes[2]
 
+            val yRowStride   = yPlane.rowStride
+            val uvRowStride  = uPlane.rowStride
+            val uvPixelStride = uPlane.pixelStride
+
+            val nv21size = w * h * 3 / 2
+            val nv21 = ByteArray(nv21size)
+
+            // Copiar plano Y respetando rowStride
             val yBuf = yPlane.buffer
-            val uBuf = uPlane.buffer
+            for (row in 0 until h) {
+                yBuf.position(row * yRowStride)
+                yBuf.get(nv21, row * w, w)
+            }
+
+            // Copiar planos U/V intercalados como VU (NV21)
+            val uvOffset = w * h
             val vBuf = vPlane.buffer
+            val uBuf = uPlane.buffer
 
-            // Construir NV21 con los planos yuv
-            val ySize = yBuf.remaining()
-            val uSize = uBuf.remaining()
-            val vSize = vBuf.remaining()
-            val nv21  = ByteArray(ySize + uSize + vSize)
-            yBuf.get(nv21, 0, ySize)
-            vBuf.get(nv21, ySize, vSize)
-            uBuf.get(nv21, ySize + vSize, uSize)
+            if (uvPixelStride == 2) {
+                // Semi-planar: V buffer ya tiene VU intercalado
+                for (row in 0 until h / 2) {
+                    vBuf.position(row * uvRowStride)
+                    vBuf.get(nv21, uvOffset + row * w, w)
+                }
+            } else {
+                // Planar: intercalar V y U manualmente
+                var uvIdx = uvOffset
+                for (row in 0 until h / 2) {
+                    for (col in 0 until w / 2) {
+                        nv21[uvIdx++] = vBuf.get(row * uvRowStride + col)
+                        nv21[uvIdx++] = uBuf.get(row * uvRowStride + col)
+                    }
+                }
+            }
 
-            // NV21 → Mat BGRA vía OpenCV
-            val nv21Mat = Mat(image.height + image.height / 2, image.width, CvType.CV_8UC1)
+            // NV21 → Mat RGBA vía OpenCV
+            val nv21Mat = Mat(h + h / 2, w, CvType.CV_8UC1)
             nv21Mat.put(0, 0, nv21)
             val rgbaMat = Mat()
             org.opencv.imgproc.Imgproc.cvtColor(nv21Mat, rgbaMat, org.opencv.imgproc.Imgproc.COLOR_YUV2RGBA_NV21)

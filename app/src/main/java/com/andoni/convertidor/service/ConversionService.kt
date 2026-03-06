@@ -128,12 +128,20 @@ class ConversionService : Service() {
         // ── Pipeline de FPS ────────────────────────────────────────────────
 
         val srcFps = run {
-            val r = MediaMetadataRetriever()
+            val ex = MediaExtractor()
             try {
-                r.setDataSource(applicationContext, inputUri)
-                r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-                    ?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 } ?: 30
-            } catch (_: Exception) { 30 } finally { r.release() }
+                ex.setDataSource(applicationContext, inputUri, null)
+                var fps = -1
+                for (i in 0 until ex.trackCount) {
+                    val fmt = ex.getTrackFormat(i)
+                    if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                        fps = if (fmt.containsKey(MediaFormat.KEY_FRAME_RATE))
+                            fmt.getInteger(MediaFormat.KEY_FRAME_RATE) else -1
+                        break
+                    }
+                }
+                fps.takeIf { it in 1..240 } ?: 30
+            } catch (_: Exception) { 30 } finally { ex.release() }
         }
 
         if (hasFpsChange && targetFps > srcFps && FpsInterpolator.isAvailable()) {
@@ -180,10 +188,35 @@ class ConversionService : Service() {
                     tmpFile.delete()
 
                     if (muxOk && combinedFile.exists()) {
-                        val combinedUri = Uri.fromFile(combinedFile)
-                        val (vidFmt, audFmt) = buildTargetFormats(combinedUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
-                        launchLitr(capturedRequestId, combinedUri, capturedOutputPath, vidFmt, audFmt, combinedFile,
-                            hasPriorFps = true, format = capturedFormat)
+                        // La interpolación y el mux fueron exitosos:
+                        // copiar directamente al output (NO pasar por LiTr para preservar FPS).
+                        try {
+                            val outFile = File(capturedOutputPath)
+                            outFile.parentFile?.mkdirs()
+                            combinedFile.copyTo(outFile, overwrite = true)
+                            combinedFile.delete()
+
+                            _state.value = _state.value.copy(progress = 90)
+                            updateProgressNotification(90)
+
+                            val savedUri = registerFileInMediaStore(capturedOutputPath, capturedFormat)
+                            _state.value = ConversionState(
+                                isConverting = false,
+                                progress     = 100,
+                                outputPath   = capturedOutputPath,
+                                isCompleted  = true
+                            )
+                            showCompletionNotification(capturedOutputPath, savedUri)
+                            stopForeground(STOP_FOREGROUND_REMOVE)
+                            stopSelf()
+                        } catch (e: Exception) {
+                            android.util.Log.e("ConversionService", "Copy combined→output failed", e)
+                            combinedFile.delete()
+                            // Fallback: pasar original por LiTr
+                            val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
+                            launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, audFmt, null,
+                                hasPriorFps = false, format = capturedFormat)
+                        }
                     } else {
                         combinedFile.delete()
                         val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
