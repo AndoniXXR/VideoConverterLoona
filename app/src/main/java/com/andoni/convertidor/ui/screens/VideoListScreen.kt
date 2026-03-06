@@ -16,9 +16,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import coil.compose.AsyncImage
 import coil.decode.VideoFrameDecoder
 import coil.request.ImageRequest
@@ -31,10 +34,10 @@ import com.andoni.convertidor.data.formattedSize
 import kotlinx.coroutines.launch
 
 private enum class SortOrder(val label: String) {
-    DATE_DESC("MÃ¡s nuevo primero"),
-    DATE_ASC("MÃ¡s antiguo primero"),
-    NAME_ASC("Nombre A â†’ Z"),
-    NAME_DESC("Nombre Z â†’ A")
+    DATE_DESC("Más nuevo primero"),
+    DATE_ASC("Más antiguo primero"),
+    NAME_ASC("Nombre A → Z"),
+    NAME_DESC("Nombre Z → A")
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -46,13 +49,23 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
     var isLoading    by remember { mutableStateOf(true) }
     var sortOrder    by remember { mutableStateOf(SortOrder.DATE_DESC) }
     var showSortMenu by remember { mutableStateOf(false) }
-    val scope        = rememberCoroutineScope()
+    val scope         = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
 
-    LaunchedEffect(Unit) {
-        scope.launch {
-            videos    = repository.getAllVideos()
-            isLoading = false
+    // Recargar videos cada vez que la pantalla vuelve al frente.
+    // Esto cubre: carga inicial, retorno tras aceptar permisos y retorno desde otras pantallas.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                scope.launch {
+                    isLoading = true
+                    videos    = repository.getAllVideos()
+                    isLoading = false
+                }
+            }
         }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val sortedVideos = remember(videos, sortOrder) {
@@ -136,7 +149,7 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                 ) {
                     Text("No se encontraron videos", style = MaterialTheme.typography.bodyLarge)
                     Text(
-                        "AsegÃºrate de haber concedido el permiso de galerÃ­a",
+                        "Asegúrate de haber concedido el permiso de galería",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
