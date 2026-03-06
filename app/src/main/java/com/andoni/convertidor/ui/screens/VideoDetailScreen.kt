@@ -87,7 +87,7 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                         onExport   = { outputName, format, isRepair ->
                             val path = FileUtils.buildOutputPath(context, outputName, format)
                             val intent = Intent(context, ConversionService::class.java).apply {
-                                putExtra(ConversionService.EXTRA_INPUT_PATH,  currentVideo.path)
+                                putExtra(ConversionService.EXTRA_INPUT_URI,   currentVideo.uri.toString())
                                 putExtra(ConversionService.EXTRA_OUTPUT_PATH, path)
                                 putExtra(ConversionService.EXTRA_FORMAT,      format)
                                 putExtra(ConversionService.EXTRA_IS_REPAIR,   isRepair)

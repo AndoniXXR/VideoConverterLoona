@@ -27,7 +27,8 @@ import java.util.UUID
 class ConversionService : Service() {
 
     companion object {
-        const val EXTRA_INPUT_PATH  = "input_path"
+        const val EXTRA_INPUT_URI   = "input_uri"
+        const val EXTRA_INPUT_PATH  = "input_path"  // mantenido por compatibilidad
         const val EXTRA_OUTPUT_PATH = "output_path"
         const val EXTRA_FORMAT      = "format"
         const val EXTRA_IS_REPAIR   = "is_repair"
@@ -69,11 +70,13 @@ class ConversionService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val inputPath  = intent?.getStringExtra(EXTRA_INPUT_PATH)  ?: return stopAndReturn()
-        val outputPath = intent.getStringExtra(EXTRA_OUTPUT_PATH)  ?: return stopAndReturn()
-        val format     = intent.getStringExtra(EXTRA_FORMAT)       ?: "mp4"
+        // Aceptar tanto EXTRA_INPUT_URI (content://) como EXTRA_INPUT_PATH (compatibilidad)
+        val inputUriStr = intent?.getStringExtra(EXTRA_INPUT_URI)
+            ?: intent?.getStringExtra(EXTRA_INPUT_PATH)
+        val outputPath  = intent?.getStringExtra(EXTRA_OUTPUT_PATH) ?: return stopAndReturn()
+        val format      = intent?.getStringExtra(EXTRA_FORMAT)      ?: "mp4"
 
-        if (inputPath.isBlank()) {
+        if (inputUriStr.isNullOrBlank()) {
             _state.value = ConversionState(error = "No se puede acceder al archivo de video")
             return stopAndReturn()
         }
@@ -83,7 +86,13 @@ class ConversionService : Service() {
         startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0))
         _state.value = ConversionState(isConverting = true, progress = 0)
 
-        val inputUri   = Uri.fromFile(File(inputPath))
+        // Si es URI de contenido (content://) la usamos directamente.
+        // Si es ruta de archivo la convertimos a file://
+        val inputUri = if (inputUriStr.startsWith("content://") || inputUriStr.startsWith("file://")) {
+            Uri.parse(inputUriStr)
+        } else {
+            Uri.fromFile(File(inputUriStr))
+        }
         val outputFile = File(outputPath)
         outputFile.parentFile?.mkdirs()
         val requestId  = UUID.randomUUID().toString()
