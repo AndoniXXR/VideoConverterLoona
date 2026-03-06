@@ -181,6 +181,7 @@ private fun ConversionCard(
     var isRepair   by remember { mutableStateOf(false) }
     var outputName by remember(video) { mutableStateOf(video.nameWithoutExtension) }
     val focusManager = LocalFocusManager.current
+    var showSameFormatDialog by remember { mutableStateOf(false) }
 
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -309,8 +310,14 @@ private fun ConversionCard(
             Button(
                 onClick = {
                     focusManager.clearFocus()
-                    val fmt = if (isRepair) video.extension else selectedFormat
-                    onExport(outputName.trim(), fmt, isRepair)
+                    // Si el formato elegido coincide con el original y repair está desactivado
+                    // mostrar diálogo en vez de exportar directamente
+                    if (!isRepair && selectedFormat == video.extension) {
+                        showSameFormatDialog = true
+                    } else {
+                        val fmt = if (isRepair) video.extension else selectedFormat
+                        onExport(outputName.trim(), fmt, isRepair)
+                    }
                 },
                 modifier = Modifier.fillMaxWidth(),
                 enabled  = !convState.isConverting
@@ -320,6 +327,40 @@ private fun ConversionCard(
                 Text(
                     if (isRepair) "Reparar video"
                     else "Exportar a ${selectedFormat.uppercase()}"
+                )
+            }
+
+            // Diálogo: mismo formato detectado
+            if (showSameFormatDialog) {
+                AlertDialog(
+                    onDismissRequest = { showSameFormatDialog = false },
+                    title = { Text("Mismo formato detectado") },
+                    text  = {
+                        Text(
+                            "El video ya está en formato ${video.extension.uppercase()}.\n\n" +
+                            "¿Quieres reparar el video (reconstruirlo en el mismo formato) " +
+                            "o prefieres elegir otro formato de salida?"
+                        )
+                    },
+                    confirmButton = {
+                        Button(onClick = {
+                            showSameFormatDialog = false
+                            isRepair = true
+                            onExport(outputName.trim(), video.extension, true)
+                        }) {
+                            Text("Reparar video")
+                        }
+                    },
+                    dismissButton = {
+                        OutlinedButton(onClick = {
+                            showSameFormatDialog = false
+                            // Cambiar automáticamente al primer formato distinto al actual
+                            val other = allFormats.firstOrNull { it != video.extension } ?: allFormats.first()
+                            selectedFormat = other
+                        }) {
+                            Text("Cambiar formato")
+                        }
+                    }
                 )
             }
         }
