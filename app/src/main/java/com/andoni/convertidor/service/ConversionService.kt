@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
@@ -119,14 +120,14 @@ class ConversionService : Service() {
                     updateProgressNotification(pct)
                 }
                 override fun onCompleted(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
-                    registerFileInMediaStore(outputPath, format)
+                    val savedUri = registerFileInMediaStore(outputPath, format)
                     _state.value = ConversionState(
                         isConverting = false,
                         progress     = 100,
                         outputPath   = outputPath,
                         isCompleted  = true
                     )
-                    showCompletionNotification(outputPath)
+                    showCompletionNotification(outputPath, savedUri)
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -173,16 +174,36 @@ class ConversionService : Service() {
         nm.notify(NOTIF_PROGRESS_ID, buildProgressNotification(progress))
     }
 
-    private fun showCompletionNotification(outputPath: String) {
+    private fun showCompletionNotification(outputPath: String, videoUri: Uri?) {
         val fileName = outputPath.substringAfterLast('/')
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+
+        // Si tenemos la URI del video en MediaStore, abrir directamente el reproductor.
+        // Si no, abrir la app principal como fallback.
+        val openIntent = if (videoUri != null) {
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(videoUri, "video/*")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        } else {
+            Intent(this, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
+        val pi = PendingIntent.getActivity(
+            this, NOTIF_COMPLETED_ID, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
         nm.notify(
             NOTIF_COMPLETED_ID,
             NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle("✓ Conversión completada")
-                .setContentText(fileName)
+                .setContentText("Toca para reproducir: $fileName")
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .setAutoCancel(true)
+                .setContentIntent(pi)
                 .build()
         )
     }
@@ -200,15 +221,15 @@ class ConversionService : Service() {
         )
     }
 
-    private fun registerFileInMediaStore(filePath: String, format: String) {
+    private fun registerFileInMediaStore(filePath: String, format: String): Uri? {
         val file = File(filePath)
-        if (!file.exists()) return
+        if (!file.exists()) return null
         val mimeType = when (format.lowercase()) {
             "webm" -> "video/webm"
             "3gp"  -> "video/3gpp"
             else   -> "video/mp4"
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
                 put(MediaStore.Video.Media.MIME_TYPE, mimeType)
@@ -217,7 +238,7 @@ class ConversionService : Service() {
             }
             val uri = contentResolver.insert(
                 MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL), values
-            ) ?: return
+            ) ?: return null
             try {
                 contentResolver.openOutputStream(uri)?.use { out ->
                     file.inputStream().use { it.copyTo(out) }
@@ -225,8 +246,10 @@ class ConversionService : Service() {
                 val upd = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
                 contentResolver.update(uri, upd, null, null)
                 file.delete()
+                uri
             } catch (e: Exception) {
                 contentResolver.delete(uri, null, null)
+                null
             }
         } else {
             val dest = File(
@@ -237,6 +260,7 @@ class ConversionService : Service() {
             file.copyTo(dest, overwrite = true)
             file.delete()
             MediaScannerConnection.scanFile(this, arrayOf(dest.absolutePath), null, null)
+            null  // En API <29 no podemos obtener la URI de forma síncrona
         }
     }
 
@@ -246,12 +270,12 @@ class ConversionService : Service() {
     }
 
     /**
-     * Lee las dimensiones reales del video con MediaMetadataRetriever y construye
-     * MediaFormat explícitos para la transcodificación.
-     * - mp4 / 3gp → H.264 (AVC) + AAC
-     * - webm       → VP8 + Vorbis
-     * Esto evita el error "failed to add track to the muxer" que ocurre cuando
-     * el origen es HEVC (H.265) y MediaMuxer no admite ese codec directamente.
+     * Construye MediaFormats explícitos para la transcodificación.
+     * Siempre usa H.264/AVC + AAC independientemente del formato de salida.
+     *
+     * Razón: MIMETYPE_AUDIO_VORBIS (para WebM) y VP8 no tienen encoder hardware
+     * en la mayoría de dispositivos Android modernos → causa "No encoder found".
+     * H.264/AAC está garantizado en todos los dispositivos Android (requerido por CDD).
      */
     private fun buildTargetFormats(inputUri: Uri, format: String): Pair<MediaFormat, MediaFormat> {
         val retriever = MediaMetadataRetriever()
@@ -265,12 +289,11 @@ class ConversionService : Service() {
                 ?.toIntOrNull()?.takeIf { it > 0 } ?: 1920
             height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                 ?.toIntOrNull()?.takeIf { it > 0 } ?: 1080
-            // METADATA_KEY_CAPTURE_FRAMERATE (API 23+): puede devolver null en muchos dispositivos
             val fpsStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
             val fps = fpsStr?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 }
             if (fps != null) frameRate = fps
         } catch (_: Exception) {
-            // si no se puede leer, usamos los defaults 1920x1080@30fps
+            // usar defaults 1920x1080@30fps
         } finally {
             retriever.release()
         }
@@ -283,18 +306,20 @@ class ConversionService : Service() {
             else                  ->  1_500_000  // 480p o menos
         }
 
-        val isWebm = format.equals("webm", ignoreCase = true)
-        val videoMime = if (isWebm) MediaFormat.MIMETYPE_VIDEO_VP8  else MediaFormat.MIMETYPE_VIDEO_AVC
-        val audioMime = if (isWebm) MediaFormat.MIMETYPE_AUDIO_VORBIS else MediaFormat.MIMETYPE_AUDIO_AAC
-
-        val videoFormat = MediaFormat.createVideoFormat(videoMime, width, height).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE,        videoBitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE,      frameRate)
+        // Siempre H.264 (AVC) + AAC: únicos codecs con encoder hardware garantizado
+        // en todos los dispositivos Android (requerimiento del CDD de Android).
+        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE,         videoBitRate)
+            setInteger(MediaFormat.KEY_FRAME_RATE,       frameRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         }
 
-        val audioFormat = MediaFormat.createAudioFormat(audioMime, 44100, 2).apply {
-            setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+        val audioFormat = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE,    128_000)
+            setInteger(MediaFormat.KEY_AAC_PROFILE,
+                MediaCodecInfo.CodecProfileLevel.AACObjectLC)
         }
 
         return Pair(videoFormat, audioFormat)
