@@ -3,6 +3,7 @@ package com.andoni.convertidor.ui.screens
 import android.content.Intent
 import android.os.Build
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -17,6 +18,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -37,6 +39,8 @@ import com.andoni.convertidor.data.resolution
 import com.andoni.convertidor.data.resolutionPresetsFor
 import com.andoni.convertidor.service.ConversionService
 import com.andoni.convertidor.util.FileUtils
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -73,11 +77,13 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                 contentAlignment = Alignment.Center
             ) { CircularProgressIndicator() }
         } else {
+            val scrollState = rememberScrollState()
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
-                    .verticalScroll(rememberScrollState())
+                    .imePadding()
+                    .verticalScroll(scrollState)
             ) {
                 VideoPlayerSection(currentVideo)
 
@@ -87,9 +93,10 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                 ) {
                     VideoInfoCard(currentVideo)
                     ConversionCard(
-                        video      = currentVideo,
-                        convState  = convState,
-                        onExport   = { outputName, format, isRepair, targetW, targetH, targetFps ->
+                        video       = currentVideo,
+                        convState   = convState,
+                        scrollState = scrollState,
+                        onExport    = { outputName, format, isRepair, targetW, targetH, targetFps ->
                             val path = FileUtils.buildOutputPath(context, outputName, format)
                             val intent = Intent(context, ConversionService::class.java).apply {
                                 putExtra(ConversionService.EXTRA_INPUT_URI,     currentVideo.uri.toString())
@@ -195,9 +202,10 @@ private fun formatEstimate(secs: Int): String = when {
 
 @Composable
 private fun ConversionCard(
-    video:     VideoItem,
-    convState: ConversionService.ConversionState,
-    onExport:  (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int) -> Unit
+    video:       VideoItem,
+    convState:   ConversionService.ConversionState,
+    scrollState: ScrollState,
+    onExport:    (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int) -> Unit
 ) {
     val allFormats = listOf("mp4", "webm", "3gp")
     var selectedFormat by remember {
@@ -206,6 +214,7 @@ private fun ConversionCard(
     var isRepair   by remember { mutableStateOf(false) }
     var outputName by remember(video) { mutableStateOf(video.nameWithoutExtension) }
     val focusManager = LocalFocusManager.current
+    val coroutineScope = rememberCoroutineScope()
 
     // ── Ajuste de resolución ──
     var changeResolution by remember { mutableStateOf(false) }
@@ -497,7 +506,14 @@ private fun ConversionCard(
                 label        = { Text("Nombre del archivo exportado") },
                 placeholder  = { Text("Dejar vacío para nombre automático") },
                 singleLine   = true,
-                modifier     = Modifier.fillMaxWidth(),
+                modifier     = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged {
+                        if (it.isFocused) coroutineScope.launch {
+                            delay(300)
+                            scrollState.animateScrollTo(scrollState.maxValue)
+                        }
+                    },
                 keyboardOptions  = KeyboardOptions(imeAction = ImeAction.Done),
                 keyboardActions  = KeyboardActions(onDone = { focusManager.clearFocus() }),
                 suffix = { Text(".${if (isRepair) video.extension else selectedFormat}") }

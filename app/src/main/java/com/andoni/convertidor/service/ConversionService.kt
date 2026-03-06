@@ -6,9 +6,12 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
+import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -24,6 +27,7 @@ import com.linkedin.android.litr.analytics.TrackTransformationInfo
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.UUID
 
 class ConversionService : Service() {
@@ -169,10 +173,29 @@ class ConversionService : Service() {
 
                 if (Thread.currentThread().isInterrupted) return@Thread
 
-                val litrUri = if (ok && tmpFile.exists()) Uri.fromFile(tmpFile) else capturedInputUri
-                val (vidFmt, audFmt) = buildTargetFormats(litrUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
-                launchLitr(capturedRequestId, litrUri, capturedOutputPath, vidFmt, audFmt, tmpFile,
-                    hasPriorFps = ok, format = capturedFormat)
+                if (ok && tmpFile.exists()) {
+                    // Mux: video interpolado + audio del original → archivo combinado
+                    val combinedFile = File(cacheDir, "fps_combined_${System.currentTimeMillis()}.mp4")
+                    val muxOk = muxVideoWithOriginalAudio(tmpFile, capturedInputUri, combinedFile)
+                    tmpFile.delete()
+
+                    if (muxOk && combinedFile.exists()) {
+                        val combinedUri = Uri.fromFile(combinedFile)
+                        val (vidFmt, audFmt) = buildTargetFormats(combinedUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
+                        launchLitr(capturedRequestId, combinedUri, capturedOutputPath, vidFmt, audFmt, combinedFile,
+                            hasPriorFps = true, format = capturedFormat)
+                    } else {
+                        combinedFile.delete()
+                        val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
+                        launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, audFmt, null,
+                            hasPriorFps = false, format = capturedFormat)
+                    }
+                } else {
+                    tmpFile.delete()
+                    val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
+                    launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, audFmt, null,
+                        hasPriorFps = false, format = capturedFormat)
+                }
             }
             thread.name = "fps-interpolator"
             thread.isDaemon = true
@@ -367,6 +390,85 @@ class ConversionService : Service() {
     private fun stopAndReturn(): Int {
         stopSelf()
         return START_NOT_STICKY
+    }
+
+    /**
+     * Combina el track de video del archivo interpolado con el audio del video original.
+     * Si el original no tiene audio, el resultado solo tendrá video.
+     */
+    private fun muxVideoWithOriginalAudio(
+        videoFile: File,
+        originalUri: Uri,
+        outputFile: File
+    ): Boolean {
+        val videoExtractor = MediaExtractor()
+        val audioExtractor = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        return try {
+            videoExtractor.setDataSource(videoFile.absolutePath)
+            var videoFormat: MediaFormat? = null
+            var vidIdx = -1
+            for (i in 0 until videoExtractor.trackCount) {
+                val fmt = videoExtractor.getTrackFormat(i)
+                if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                    vidIdx = i; videoFormat = fmt; break
+                }
+            }
+            if (vidIdx < 0 || videoFormat == null) return false
+            videoExtractor.selectTrack(vidIdx)
+
+            audioExtractor.setDataSource(applicationContext, originalUri, null)
+            var audioFormat: MediaFormat? = null
+            var audIdx = -1
+            for (i in 0 until audioExtractor.trackCount) {
+                val fmt = audioExtractor.getTrackFormat(i)
+                if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                    audIdx = i; audioFormat = fmt; break
+                }
+            }
+            if (audIdx >= 0) audioExtractor.selectTrack(audIdx)
+
+            outputFile.parentFile?.mkdirs()
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxVid = muxer!!.addTrack(videoFormat)
+            val muxAud = if (audIdx >= 0 && audioFormat != null) muxer!!.addTrack(audioFormat) else -1
+            muxer!!.start()
+
+            val buf = ByteBuffer.allocate(1024 * 1024)
+            val info = MediaCodec.BufferInfo()
+
+            while (true) {
+                buf.clear()
+                val sz = videoExtractor.readSampleData(buf, 0)
+                if (sz < 0) break
+                info.set(0, sz, videoExtractor.sampleTime, videoExtractor.sampleFlags)
+                muxer!!.writeSampleData(muxVid, buf, info)
+                videoExtractor.advance()
+            }
+
+            if (muxAud >= 0) {
+                while (true) {
+                    buf.clear()
+                    val sz = audioExtractor.readSampleData(buf, 0)
+                    if (sz < 0) break
+                    info.set(0, sz, audioExtractor.sampleTime, audioExtractor.sampleFlags)
+                    muxer!!.writeSampleData(muxAud, buf, info)
+                    audioExtractor.advance()
+                }
+            }
+
+            muxer!!.stop()
+            muxer!!.release()
+            muxer = null
+            outputFile.exists() && outputFile.length() > 0
+        } catch (e: Exception) {
+            android.util.Log.e("ConversionService", "muxVideoWithOriginalAudio failed", e)
+            false
+        } finally {
+            videoExtractor.release()
+            audioExtractor.release()
+            try { muxer?.release() } catch (_: Exception) {}
+        }
     }
 
     /**
