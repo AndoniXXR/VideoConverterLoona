@@ -39,6 +39,7 @@ class ConversionService : Service() {
         const val EXTRA_TARGET_HEIGHT = "target_height"
 
         const val CHANNEL_ID             = "conversion_channel"
+        const val CHANNEL_ALERT_ID       = "conversion_alert_channel"
         const val NOTIF_PROGRESS_ID      = 1001
         const val NOTIF_COMPLETED_ID     = 1002
         const val NOTIF_ERROR_ID         = 1003
@@ -209,10 +210,11 @@ class ConversionService : Service() {
 
         nm.notify(
             NOTIF_COMPLETED_ID,
-            NotificationCompat.Builder(this, CHANNEL_ID)
+            NotificationCompat.Builder(this, CHANNEL_ALERT_ID)
                 .setContentTitle("✓ Conversión completada")
                 .setContentText("Toca para reproducir: $fileName")
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setAutoCancel(true)
                 .setContentIntent(pi)
                 .build()
@@ -223,10 +225,11 @@ class ConversionService : Service() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(
             NOTIF_ERROR_ID,
-            NotificationCompat.Builder(this, CHANNEL_ID)
+            NotificationCompat.Builder(this, CHANNEL_ALERT_ID)
                 .setContentTitle("Error en la conversión")
                 .setContentText("Revisa el video e inténtalo de nuevo")
                 .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setAutoCancel(true)
                 .build()
         )
