@@ -29,17 +29,20 @@ import java.util.UUID
 class ConversionService : Service() {
 
     companion object {
-        const val EXTRA_INPUT_URI   = "input_uri"
-        const val EXTRA_INPUT_PATH  = "input_path"  // mantenido por compatibilidad
-        const val EXTRA_OUTPUT_PATH = "output_path"
-        const val EXTRA_FORMAT      = "format"
-        const val EXTRA_IS_REPAIR   = "is_repair"
-        const val EXTRA_DURATION_MS = "duration_ms"
+        const val EXTRA_INPUT_URI    = "input_uri"
+        const val EXTRA_INPUT_PATH   = "input_path"  // mantenido por compatibilidad
+        const val EXTRA_OUTPUT_PATH  = "output_path"
+        const val EXTRA_FORMAT       = "format"
+        const val EXTRA_IS_REPAIR    = "is_repair"
+        const val EXTRA_DURATION_MS  = "duration_ms"
+        const val EXTRA_TARGET_WIDTH  = "target_width"
+        const val EXTRA_TARGET_HEIGHT = "target_height"
 
-        const val CHANNEL_ID          = "conversion_channel"
-        const val NOTIF_PROGRESS_ID   = 1001
-        const val NOTIF_COMPLETED_ID  = 1002
-        const val NOTIF_ERROR_ID      = 1003
+        const val CHANNEL_ID             = "conversion_channel"
+        const val NOTIF_PROGRESS_ID      = 1001
+        const val NOTIF_COMPLETED_ID     = 1002
+        const val NOTIF_ERROR_ID         = 1003
+        const val NOTIF_RESOLUTION_ID    = 1004
 
         private val _state = MutableStateFlow(ConversionState())
         val state = _state.asStateFlow()
@@ -85,7 +88,10 @@ class ConversionService : Service() {
 
         currentRequestId?.let { transformer?.cancel(it) }
 
-        startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0))
+        val hasResolutionChange = (intent?.getIntExtra(EXTRA_TARGET_WIDTH, -1) ?: -1) > 0
+        val notifTitle = if (hasResolutionChange) "Cambiando resolución…" else "Convirtiendo video…"
+        _notifTitle = notifTitle
+        startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0, notifTitle))
         _state.value = ConversionState(isConverting = true, progress = 0)
 
         // Si es URI de contenido (content://) la usamos directamente.
@@ -102,7 +108,10 @@ class ConversionService : Service() {
 
         // Forzar transcodificación explícita H.264/AAC para compatibilidad universal.
         // El passthrough (null,null) falla en videos HEVC/H.265 que graban los móviles modernos.
-        val (targetVideoFormat, targetAudioFormat) = buildTargetFormats(inputUri, format)
+        val targetW = intent?.getIntExtra(EXTRA_TARGET_WIDTH,  -1) ?: -1
+        val targetH = intent?.getIntExtra(EXTRA_TARGET_HEIGHT, -1) ?: -1
+
+        val (targetVideoFormat, targetAudioFormat) = buildTargetFormats(inputUri, format, targetW, targetH)
 
         transformer?.transform(
             requestId,
@@ -151,7 +160,7 @@ class ConversionService : Service() {
 
     // ── Notificaciones ────────────────────────────────────────────────────────
 
-    private fun buildProgressNotification(progress: Int): Notification {
+    private fun buildProgressNotification(progress: Int, title: String = "Convirtiendo video…"): Notification {
         val pi = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -159,7 +168,7 @@ class ConversionService : Service() {
         )
         val isIndeterminate = progress == 0
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Convirtiendo video…")
+            .setContentTitle(title)
             .setContentText(if (isIndeterminate) "Iniciando…" else "$progress%")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .setProgress(100, progress, isIndeterminate)
@@ -169,9 +178,11 @@ class ConversionService : Service() {
             .build()
     }
 
+    private var _notifTitle = "Convirtiendo video…"
+
     private fun updateProgressNotification(progress: Int) {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-        nm.notify(NOTIF_PROGRESS_ID, buildProgressNotification(progress))
+        nm.notify(NOTIF_PROGRESS_ID, buildProgressNotification(progress, _notifTitle))
     }
 
     private fun showCompletionNotification(outputPath: String, videoUri: Uri?) {
@@ -277,17 +288,22 @@ class ConversionService : Service() {
      * en la mayoría de dispositivos Android modernos → causa "No encoder found".
      * H.264/AAC está garantizado en todos los dispositivos Android (requerido por CDD).
      */
-    private fun buildTargetFormats(inputUri: Uri, format: String): Pair<MediaFormat, MediaFormat> {
+    private fun buildTargetFormats(
+        inputUri: Uri,
+        format: String,
+        targetWidth: Int = -1,
+        targetHeight: Int = -1
+    ): Pair<MediaFormat, MediaFormat> {
         val retriever = MediaMetadataRetriever()
-        var width     = 1920
-        var height    = 1080
+        var srcWidth  = 1920
+        var srcHeight = 1080
         var frameRate = 30
 
         try {
             retriever.setDataSource(applicationContext, inputUri)
-            width  = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            srcWidth  = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
                 ?.toIntOrNull()?.takeIf { it > 0 } ?: 1920
-            height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            srcHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
                 ?.toIntOrNull()?.takeIf { it > 0 } ?: 1080
             val fpsStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
             val fps = fpsStr?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 }
@@ -298,17 +314,21 @@ class ConversionService : Service() {
             retriever.release()
         }
 
-        val pixels = width * height
+        // Si el usuario especificó resolución destino, respetarla; si no, mantener la original
+        val width  = if (targetWidth  > 0) targetWidth  else srcWidth
+        val height = if (targetHeight > 0) targetHeight else srcHeight
+
+        val pixels = width.toLong() * height.toLong()
         val videoBitRate = when {
-            pixels >= 3840 * 2160 -> 15_000_000  // 4K
-            pixels >= 1920 * 1080 ->  6_000_000  // 1080p
-            pixels >= 1280 *  720 ->  3_000_000  // 720p
-            else                  ->  1_500_000  // 480p o menos
+            pixels >= 3840L * 2160 -> 15_000_000  // 4K
+            pixels >= 1920L * 1080 ->  6_000_000  // 1080p
+            pixels >= 1280L *  720 ->  3_000_000  // 720p
+            else                   ->  1_500_000  // 480p o menos
         }
 
         // Siempre H.264 (AVC) + AAC: únicos codecs con encoder hardware garantizado
         // en todos los dispositivos Android (requerimiento del CDD de Android).
-        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        val videoFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width.toInt(), height.toInt()).apply {
             setInteger(MediaFormat.KEY_BIT_RATE,         videoBitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE,       frameRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
