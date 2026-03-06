@@ -62,6 +62,7 @@ class ConversionService : Service() {
 
     private var transformer: MediaTransformer? = null
     private var currentRequestId: String? = null
+    @Volatile private var interpolationThread: Thread? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -72,6 +73,7 @@ class ConversionService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        interpolationThread?.interrupt()
         currentRequestId?.let { transformer?.cancel(it) }
         transformer?.release()
     }
@@ -113,17 +115,13 @@ class ConversionService : Service() {
         val outputFile = File(outputPath)
         outputFile.parentFile?.mkdirs()
         val requestId  = UUID.randomUUID().toString()
+
         currentRequestId = requestId
 
-        val targetW = intent?.getIntExtra(EXTRA_TARGET_WIDTH,  -1) ?: -1
-        val targetH = intent?.getIntExtra(EXTRA_TARGET_HEIGHT, -1) ?: -1
+        val targetW = intent.getIntExtra(EXTRA_TARGET_WIDTH,  -1)
+        val targetH = intent.getIntExtra(EXTRA_TARGET_HEIGHT, -1)
 
-        // ── Pipeline de FPS ──────────────────────────────────────────────────
-        // Si el usuario quiere subir FPS usamos FpsInterpolator (optical flow).
-        // Si quiere bajar FPS, LiTr lo maneja vía KEY_FRAME_RATE en buildTargetFormats.
-        // En ambos casos LiTr hace el transcode final de formato/resolución.
-        val litrInputUri: Uri
-        var tempInterpolatedFile: File? = null
+        // ── Pipeline de FPS ────────────────────────────────────────────────
 
         val srcFps = run {
             val r = MediaMetadataRetriever()
@@ -135,55 +133,89 @@ class ConversionService : Service() {
         }
 
         if (hasFpsChange && targetFps > srcFps && FpsInterpolator.isAvailable()) {
+            // Interpolar FPS en un Thread de fondo para NO bloquear onStartCommand.
+            // Una vez terminado (o si falla), arrancamos LiTr desde ese mismo thread.
             updateProgressNotification(0)
-            val tmpDir = cacheDir
-            val tmpFile = File(tmpDir, "fps_interp_${System.currentTimeMillis()}.mp4")
-            tempInterpolatedFile = tmpFile
-            val ok = FpsInterpolator.interpolate(
-                context       = applicationContext,
-                inputUri      = inputUri,
-                outputFile    = tmpFile,
-                targetFps     = targetFps,
-                targetWidth   = targetW,
-                targetHeight  = targetH,
-                onProgress    = { pct ->
-                    // Mapear 0..100 del interpolador a 0..60 del progreso total
-                    val mapped = (pct * 0.60).toInt()
-                    _state.value = _state.value.copy(progress = mapped)
-                    updateProgressNotification(mapped)
+            val tmpFile = File(cacheDir, "fps_interp_${System.currentTimeMillis()}.mp4")
+
+            // Las variables que el thread usa deben ser val inmutables
+            val capturedInputUri  = inputUri
+            val capturedOutputPath = outputPath
+            val capturedFormat    = format
+            val capturedTargetW   = targetW
+            val capturedTargetH   = targetH
+            val capturedFps       = targetFps
+            val capturedRequestId = requestId
+
+            val thread = Thread {
+                val ok = try {
+                    FpsInterpolator.interpolate(
+                        context      = applicationContext,
+                        inputUri     = capturedInputUri,
+                        outputFile   = tmpFile,
+                        targetFps    = capturedFps,
+                        targetWidth  = capturedTargetW,
+                        targetHeight = capturedTargetH,
+                        onProgress   = { pct ->
+                            val mapped = (pct * 0.60).toInt()
+                            _state.value = _state.value.copy(progress = mapped)
+                            updateProgressNotification(mapped)
+                        }
+                    )
+                } catch (e: Exception) {
+                    android.util.Log.e("ConversionService", "FPS interpolation failed", e)
+                    false
                 }
-            )
-            litrInputUri = if (ok && tmpFile.exists()) Uri.fromFile(tmpFile) else inputUri
+
+                if (Thread.currentThread().isInterrupted) return@Thread
+
+                val litrUri = if (ok && tmpFile.exists()) Uri.fromFile(tmpFile) else capturedInputUri
+                val (vidFmt, audFmt) = buildTargetFormats(litrUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
+                launchLitr(capturedRequestId, litrUri, capturedOutputPath, vidFmt, audFmt, tmpFile,
+                    hasPriorFps = ok, format = capturedFormat)
+            }
+            thread.name = "fps-interpolator"
+            thread.isDaemon = true
+            interpolationThread = thread
+            thread.start()
+            return START_NOT_STICKY
         } else {
-            litrInputUri = inputUri
+            // Sin interpolación de FPS: ir directamente a LiTr
+            val (videoFmt, audioFmt) = buildTargetFormats(inputUri, format, targetW, targetH, targetFps)
+            launchLitr(requestId, inputUri, outputPath, videoFmt, audioFmt, null, format = format)
         }
+        return START_NOT_STICKY
+    }
 
-        // Forzar transcodificación explícita H.264/AAC para compatibilidad universal.
-        // El passthrough (null,null) falla en videos HEVC/H.265 que graban los móviles modernos.
-        val (targetVideoFormat, targetAudioFormat) = buildTargetFormats(
-            litrInputUri, format, targetW, targetH, targetFps
-        )
-
+    private fun launchLitr(
+        requestId:    String,
+        inputUri:     Uri,
+        outputPath:   String,
+        videoFormat:  MediaFormat,
+        audioFormat:  MediaFormat,
+        tempFile:     File?,
+        hasPriorFps:  Boolean = false,
+        format:       String  = "mp4"
+    ) {
         transformer?.transform(
             requestId,
-            litrInputUri,
+            inputUri,
             outputPath,
-            targetVideoFormat,
-            targetAudioFormat,
+            videoFormat,
+            audioFormat,
             object : TransformationListener {
                 override fun onStarted(id: String) {
                     _state.value = ConversionState(isConverting = true, progress = 1)
                 }
                 override fun onProgress(id: String, progress: Float) {
-                    // Si hubo interpolación previa ocupa 0..60; LiTr ocupa 60..100
-                    val base = if (tempInterpolatedFile != null) 60 else 0
-                    val span = if (tempInterpolatedFile != null) 40 else 100
+                    val base = if (hasPriorFps) 60 else 0
+                    val span = if (hasPriorFps) 40 else 100
                     val pct = (base + progress * span).toInt().coerceIn(base + 1, 99)
                     _state.value = _state.value.copy(progress = pct)
                     updateProgressNotification(pct)
                 }
                 override fun onCompleted(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
-                    tempInterpolatedFile?.delete()
+                    tempFile?.delete()
                     val savedUri = registerFileInMediaStore(outputPath, format)
                     _state.value = ConversionState(
                         isConverting = false,
@@ -196,13 +228,13 @@ class ConversionService : Service() {
                     stopSelf()
                 }
                 override fun onCancelled(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
-                    tempInterpolatedFile?.delete()
+                    tempFile?.delete()
                     _state.value = ConversionState(error = "Conversión cancelada")
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
                 override fun onError(id: String, cause: Throwable?, trackTransformationInfos: List<TrackTransformationInfo>?) {
-                    tempInterpolatedFile?.delete()
+                    tempFile?.delete()
                     _state.value = ConversionState(error = cause?.message ?: "Error desconocido durante la conversión")
                     showErrorNotification()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -211,8 +243,6 @@ class ConversionService : Service() {
             },
             TransformationOptions.Builder().build()
         )
-
-        return START_NOT_STICKY
     }
 
     // ── Notificaciones ────────────────────────────────────────────────────────

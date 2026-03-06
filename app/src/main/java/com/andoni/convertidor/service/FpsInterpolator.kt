@@ -13,518 +13,602 @@ import java.io.File
 import java.nio.ByteBuffer
 
 /**
- * Interpolador de FPS usando Optical Flow clásico (Farneback) de OpenCV.
+ * Interpolador de FPS — arquitectura STREAMING.
  *
- * Pipeline:
- *  1. Decodificar todos los frames del video fuente con MediaCodec → Bitmap.
- *  2. Para cada par de frames consecutivos, calcular optical flow bidireccional.
- *  3. Generar N-1 frames intermedios usando warp + mezcla ponderada.
- *  4. Re-codificar la secuencia nueva con MediaCodec encoder → MP4 con MediaMuxer.
+ * Principios de diseño (evitar OOM/ANR):
+ *  • Nunca se cargan todos los frames en RAM a la vez. Se procesan de a UN PAR por vez.
+ *  • El mapa de remapeo se construye con operaciones vectorizadas de OpenCV (sin bucle pixel).
+ *  • Encoder + Muxer se mantienen abiertos durante todo el proceso; cada frame se escribe
+ *    al disco inmediatamente y el Bitmap/Mat se libera antes de pasar al siguiente par.
+ *  • Este método BLOQUEA el hilo que lo invoca — llamarlo siempre desde un Thread/Coroutine
+ *    dedicado (NO desde onStartCommand directamente).
  *
- * Limitaciones documentadas:
- *  - Falla visualmente en cortes de escena abruptos (se detectan y se duplica el frame anterior).
- *  - Para movimientos muy rápidos (>80px/frame) el resultado puede tener ghosting ligero.
- *  - Solo salida MP4/H.264 independientemente del formato final (LiTr hace la conversión después).
+ *  Para bajar FPS: no usar este objeto. LiTr lo maneja con KEY_FRAME_RATE.
+ *  Para subir  FPS: llamar interpolate() que devuelve true si tuvo éxito.
  */
 object FpsInterpolator {
 
-    private const val TAG = "FpsInterpolator"
+    private const val TAG        = "FpsInterpolator"
     private const val TIMEOUT_US = 10_000L
 
-    /** Devuelve true si OpenCV pudo inicializarse. */
+    // Resolución máxima para el cálculo de optical flow.
+    // Si el video es más grande se escala antes de Farneback y el flow se re-escala.
+    // Esto reduce el tiempo de cálculo de O(W×H) a O(FLOW_MAX_W×FLOW_MAX_H).
+    private const val FLOW_MAX_W = 480
+    private const val FLOW_MAX_H = 270
+
     fun isAvailable(): Boolean = OpenCVLoader.initLocal()
 
+    // ──────────────────────────────────────────────────────────────────────────
+    // PUBLIC API
+    // ──────────────────────────────────────────────────────────────────────────
+
     /**
-     * @param context       Contexto Android.
-     * @param inputUri      URI del video fuente (content://).
-     * @param outputFile    Archivo de salida temporal (debe ser .mp4).
-     * @param targetFps     FPS de destino (ej. 60).
-     * @param targetWidth   Ancho final (-1 = mantener original).
-     * @param targetHeight  Alto final (-1 = mantener original).
-     * @param onProgress    Callback 0..100 para actualizar la notificación.
-     * @return true si tuvo éxito.
+     * Interpola frames para pasar de [srcFps] a [targetFps] usando Farneback optical flow.
+     * Pipeline streaming: decodifica, interpola y codifica un par de frames a la vez.
+     *
+     * @param onProgress  Callback llamado con valores 0..100. Se puede llamar frecuentemente.
+     * @return  true si el archivo de salida fue creado con éxito.
      */
     fun interpolate(
-        context: Context,
-        inputUri: Uri,
-        outputFile: File,
-        targetFps: Int,
+        context:     Context,
+        inputUri:    Uri,
+        outputFile:  File,
+        targetFps:   Int,
         targetWidth: Int = -1,
         targetHeight: Int = -1,
-        onProgress: (Int) -> Unit = {}
+        onProgress:  (Int) -> Unit = {}
     ): Boolean {
         if (!isAvailable()) {
             Log.e(TAG, "OpenCV no disponible")
             return false
         }
 
-        // ── 1. Leer metadatos ─────────────────────────────────────────────────
-        val retriever = MediaMetadataRetriever()
-        retriever.setDataSource(context, inputUri)
-        val srcFps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-            ?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 } ?: 30
-        val srcW = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-            ?.toIntOrNull()?.takeIf { it > 0 } ?: 1280
-        val srcH = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-            ?.toIntOrNull()?.takeIf { it > 0 } ?: 720
-        val durationUs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-            ?.toLongOrNull()?.let { it * 1000L } ?: 0L
-        retriever.release()
+        // ── Metadatos del video fuente ────────────────────────────────────────
+        val meta = readVideoMeta(context, inputUri)
+        val srcFps = meta.fps
+        val srcW   = meta.width
+        val srcH   = meta.height
 
         if (targetFps <= srcFps) {
-            // Bajar FPS: solo cambiar KEY_FRAME_RATE en LiTr es suficiente.
-            // Este interpolador solo actúa para subir FPS.
-            Log.w(TAG, "targetFps ($targetFps) <= srcFps ($srcFps), interpolación no necesaria")
+            Log.w(TAG, "targetFps ($targetFps) <= srcFps ($srcFps): no se necesita interpolación")
             return false
         }
 
-        val outW = if (targetWidth  > 0) targetWidth  else srcW
-        val outH = if (targetHeight > 0) targetHeight else srcH
+        // interpFactor = cuántos frames de salida por cada frame fuente
+        // 30→60: factor 2 (1 original + 1 interpolado)
+        // 30→120: factor 4
+        val interpFactor  = targetFps / srcFps
+        val outW          = if (targetWidth  > 0) targetWidth  else srcW
+        val outH          = if (targetHeight > 0) targetHeight else srcH
+        val frameDurUs    = 1_000_000L / targetFps
 
-        // Factor de interpolación: cuántos frames intermedios generar por par de frames fuente
-        // Ej: 30→60 = 1 frame intermedio; 30→120 = 3 frames intermedios
-        val interpFactor = targetFps / srcFps   // entero; ej 2 para 30→60
-        // Intervalos de tiempo entre frames de destino (microsegundos)
-        val frameDurationUs = 1_000_000L / targetFps
-
-        Log.d(TAG, "Interpolando $srcFps→${targetFps}fps ($srcW×$srcH → ${outW}×${outH}), factor=$interpFactor")
-
-        // ── 2. Decodificar frames fuente ──────────────────────────────────────
-        val frames = decodeAllFrames(context, inputUri, srcW, srcH) ?: return false
-        if (frames.size < 2) return false
-        onProgress(20)
-
-        // ── 3. Generar frames interpolados ────────────────────────────────────
-        val outputFrames = mutableListOf<Bitmap>()
-        val totalPairs = frames.size - 1
-
-        for (i in 0 until frames.size) {
-            // Añadir el frame original
-            val bmp = if (outW != srcW || outH != srcH)
-                Bitmap.createScaledBitmap(frames[i], outW, outH, true)
-            else frames[i]
-            outputFrames.add(bmp)
-
-            // Generar frames intermedios entre frame[i] y frame[i+1]
-            if (i < frames.size - 1 && interpFactor > 1) {
-                val frameA = frames[i]
-                val frameB = frames[i + 1]
-
-                // Detectar corte de escena: si la diferencia de brillo entre frames es muy grande
-                // no interpolar (duplicar en su lugar) para evitar ghosting en cortes.
-                if (!isSceneCut(frameA, frameB)) {
-                    val matA = bitmapToMat(frameA)
-                    val matB = bitmapToMat(frameB)
-
-                    // Escalar para optical flow si la resolución es grande (mejora velocidad)
-                    val flowScale = if (srcW > 1280) 0.5f else 1.0f
-                    val flowW = (srcW * flowScale).toInt()
-                    val flowH = (srcH * flowScale).toInt()
-                    val smallA = Mat(); val smallB = Mat()
-                    org.opencv.imgproc.Imgproc.resize(matA, smallA, Size(flowW.toDouble(), flowH.toDouble()))
-                    org.opencv.imgproc.Imgproc.resize(matB, smallB, Size(flowW.toDouble(), flowH.toDouble()))
-
-                    val grayA = Mat(); val grayB = Mat()
-                    org.opencv.imgproc.Imgproc.cvtColor(smallA, grayA, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
-                    org.opencv.imgproc.Imgproc.cvtColor(smallB, grayB, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
-
-                    // Optical flow Farneback A→B
-                    val flowAB = Mat()
-                    Video.calcOpticalFlowFarneback(grayA, grayB, flowAB,
-                        0.5, 3, 15, 3, 5, 1.2, 0)
-
-                    // Escalar flow de vuelta a resolución original si se redujo
-                    val fullFlowAB = if (flowScale < 1.0f) {
-                        val scaled = Mat()
-                        org.opencv.imgproc.Imgproc.resize(flowAB, scaled, Size(srcW.toDouble(), srcH.toDouble()))
-                        Core.multiply(scaled, Scalar(1.0 / flowScale, 1.0 / flowScale), scaled)
-                        scaled
-                    } else flowAB
-
-                    for (k in 1 until interpFactor) {
-                        val alpha = k.toFloat() / interpFactor   // 0..1
-                        val interpolated = interpolateFrame(matA, matB, fullFlowAB, alpha, outW, outH)
-                        outputFrames.add(interpolated)
-                    }
-
-                    matA.release(); matB.release()
-                    smallA.release(); smallB.release()
-                    grayA.release(); grayB.release()
-                    flowAB.release()
-                    if (flowScale < 1.0f) fullFlowAB.release()
-                } else {
-                    // Corte de escena: duplicar el frame A en los huecos
-                    repeat(interpFactor - 1) { outputFrames.add(bmp) }
-                }
-            }
-
-            val progressPct = 20 + (i.toFloat() / totalPairs * 50).toInt()
-            onProgress(progressPct)
-        }
-
-        // Liberar frames fuente de memoria
-        frames.forEach { if (!it.isRecycled) it.recycle() }
-        onProgress(70)
-
-        // ── 4. Codificar frames de salida → MP4 ──────────────────────────────
-        val success = encodeFrames(outputFrames, outputFile, outW, outH, targetFps, frameDurationUs, onProgress)
-
-        outputFrames.forEach { if (!it.isRecycled) it.recycle() }
-        return success
-    }
-
-    // ── Decodificar todos los frames como Bitmap ──────────────────────────────
-
-    private fun decodeAllFrames(context: Context, uri: Uri, w: Int, h: Int): List<Bitmap>? {
-        val frames = mutableListOf<Bitmap>()
-        val extractor = MediaExtractor()
-        extractor.setDataSource(context, uri, null)
-
-        var videoTrack = -1
-        var videoFormat: MediaFormat? = null
-        for (i in 0 until extractor.trackCount) {
-            val fmt = extractor.getTrackFormat(i)
-            if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
-                videoTrack = i
-                videoFormat = fmt
-                break
-            }
-        }
-        if (videoTrack < 0 || videoFormat == null) {
-            extractor.release()
-            return null
-        }
-        extractor.selectTrack(videoTrack)
-
-        val mime = videoFormat.getString(MediaFormat.KEY_MIME)!!
-        val decoder = MediaCodec.createDecoderByType(mime)
-
-        // Surface nula → salida en ByteBuffer (YUV/RGB dependiendo del dispositivo)
-        decoder.configure(videoFormat, null, null, 0)
-        decoder.start()
-
-        val bufferInfo = MediaCodec.BufferInfo()
-        var eos = false
-
-        while (true) {
-            if (!eos) {
-                val inIdx = decoder.dequeueInputBuffer(TIMEOUT_US)
-                if (inIdx >= 0) {
-                    val buf = decoder.getInputBuffer(inIdx)!!
-                    val size = extractor.readSampleData(buf, 0)
-                    if (size < 0) {
-                        decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        eos = true
-                    } else {
-                        decoder.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
-                        extractor.advance()
-                    }
-                }
-            }
-
-            val outIdx = decoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-            if (outIdx >= 0) {
-                // Pedir el frame como imagen al decoder
-                val image = decoder.getOutputImage(outIdx)
-                if (image != null) {
-                    val bmp = imageToBitmap(image, w, h)
-                    image.close()
-                    if (bmp != null) frames.add(bmp)
-                }
-                decoder.releaseOutputBuffer(outIdx, false)
-                if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
-            } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                // ignorar
-            }
-        }
-
-        decoder.stop()
-        decoder.release()
-        extractor.release()
-        return frames
-    }
-
-    // ── Convertir Image (YUV_420_888) a Bitmap RGBA ───────────────────────────
-
-    private fun imageToBitmap(image: android.media.Image, targetW: Int, targetH: Int): Bitmap? {
-        return try {
-            // Usar YuvImage para convertir YUV_420_888 → JPEG → Bitmap
-            val yPlane = image.planes[0]
-            val uPlane = image.planes[1]
-            val vPlane = image.planes[2]
-            val yBuffer = yPlane.buffer
-            val uBuffer = uPlane.buffer
-            val vBuffer = vPlane.buffer
-            val ySize = yBuffer.remaining()
-            val uSize = uBuffer.remaining()
-            val vSize = vBuffer.remaining()
-            val nv21 = ByteArray(ySize + uSize + vSize)
-            yBuffer.get(nv21, 0, ySize)
-            vBuffer.get(nv21, ySize, vSize)
-            uBuffer.get(nv21, ySize + vSize, uSize)
-
-            val yuvImage = android.graphics.YuvImage(
-                nv21, android.graphics.ImageFormat.NV21,
-                image.width, image.height, null
-            )
-            val out = java.io.ByteArrayOutputStream()
-            yuvImage.compressToJpeg(android.graphics.Rect(0, 0, image.width, image.height), 90, out)
-            val jpegBytes = out.toByteArray()
-            val raw = android.graphics.BitmapFactory.decodeByteArray(jpegBytes, 0, jpegBytes.size)
-            if (raw.width == targetW && raw.height == targetH) raw
-            else {
-                val scaled = Bitmap.createScaledBitmap(raw, targetW, targetH, true)
-                raw.recycle()
-                scaled
-            }
-        } catch (e: Exception) {
-            Log.w(TAG, "imageToBitmap error: ${e.message}")
-            null
-        }
-    }
-
-    // ── Bitmap ↔ Mat ──────────────────────────────────────────────────────────
-
-    private fun bitmapToMat(bmp: Bitmap): Mat {
-        val mat = Mat()
-        Utils.bitmapToMat(bmp, mat)
-        return mat
-    }
-
-    private fun matToBitmap(mat: Mat, w: Int, h: Int): Bitmap {
-        val out = if (mat.cols() == w && mat.rows() == h) mat
-        else {
-            val resized = Mat()
-            org.opencv.imgproc.Imgproc.resize(mat, resized, Size(w.toDouble(), h.toDouble()))
-            resized
-        }
-        val bmp = Bitmap.createBitmap(out.cols(), out.rows(), Bitmap.Config.ARGB_8888)
-        Utils.matToBitmap(out, bmp)
-        return bmp
-    }
-
-    // ── Detectar cortes de escena (diferencia de brillo media > umbral) ───────
-
-    private fun isSceneCut(a: Bitmap, b: Bitmap): Boolean {
-        // Muestra 100 píxeles aleatorios y mide diferencia de luminancia media
-        var diff = 0.0
-        val samples = 100
-        val w = a.width; val h = a.height
-        for (i in 0 until samples) {
-            val x = (w * i / samples)
-            val y = (h * i / samples)
-            val pA = a.getPixel(x, y)
-            val pB = b.getPixel(x, y)
-            val lumaA = (0.299 * android.graphics.Color.red(pA) +
-                         0.587 * android.graphics.Color.green(pA) +
-                         0.114 * android.graphics.Color.blue(pA))
-            val lumaB = (0.299 * android.graphics.Color.red(pB) +
-                         0.587 * android.graphics.Color.green(pB) +
-                         0.114 * android.graphics.Color.blue(pB))
-            diff += Math.abs(lumaA - lumaB)
-        }
-        return (diff / samples) > 60.0  // umbral empírico
-    }
-
-    // ── Interpolar un frame intermedio con optical flow + warp ────────────────
-
-    /**
-     * Genera el frame en la posición [alpha] ∈ (0,1) entre frameA y frameB.
-     * Usa warp bidireccional: mueve A hacia adelante [alpha] y B hacia atrás [1-alpha],
-     * luego mezcla los dos warps ponderados.
-     */
-    private fun interpolateFrame(
-        matA: Mat, matB: Mat, flowAB: Mat,
-        alpha: Float, outW: Int, outH: Int
-    ): Bitmap {
-        val h = matA.rows(); val w = matA.cols()
-
-        // Construir mapa de remapeo A → posición intermedia (mover alpha * flow)
-        val mapXf = Mat(h, w, CvType.CV_32FC1)
-        val mapYf = Mat(h, w, CvType.CV_32FC1)
-        val mapXb = Mat(h, w, CvType.CV_32FC1)
-        val mapYb = Mat(h, w, CvType.CV_32FC1)
-
-        for (row in 0 until h) {
-            for (col in 0 until w) {
-                val fv = flowAB.get(row, col)  // [dx, dy]
-                val dx = fv[0].toFloat()
-                val dy = fv[1].toFloat()
-                mapXf.put(row, col, floatArrayOf(col + alpha * dx))
-                mapYf.put(row, col, floatArrayOf(row + alpha * dy))
-                mapXb.put(row, col, floatArrayOf(col - (1f - alpha) * dx))
-                mapYb.put(row, col, floatArrayOf(row - (1f - alpha) * dy))
-            }
-        }
-
-        val warpedA = Mat(); val warpedB = Mat()
-        org.opencv.imgproc.Imgproc.remap(matA, warpedA, mapXf, mapYf,
-            org.opencv.imgproc.Imgproc.INTER_LINEAR)
-        org.opencv.imgproc.Imgproc.remap(matB, warpedB, mapXb, mapYb,
-            org.opencv.imgproc.Imgproc.INTER_LINEAR)
-
-        // Mezcla ponderada
-        val blended = Mat()
-        Core.addWeighted(warpedA, (1.0 - alpha).toDouble(), warpedB, alpha.toDouble(), 0.0, blended)
-
-        val result = matToBitmap(blended, outW, outH)
-        mapXf.release(); mapYf.release(); mapXb.release(); mapYb.release()
-        warpedA.release(); warpedB.release(); blended.release()
-        return result
-    }
-
-    // ── Codificar lista de Bitmaps → MP4 con MediaCodec ──────────────────────
-
-    private fun encodeFrames(
-        frames: List<Bitmap>,
-        outputFile: File,
-        w: Int, h: Int,
-        fps: Int,
-        frameDurationUs: Long,
-        onProgress: (Int) -> Unit
-    ): Boolean {
+        Log.d(TAG, "Interpolando: $srcFps→${targetFps}fps, ${srcW}×${srcH}→${outW}×${outH}, factor=$interpFactor")
         outputFile.parentFile?.mkdirs()
 
-        val pixels = w.toLong() * h
-        val bitRate = when {
-            pixels >= 3840L * 2160 -> 15_000_000
-            pixels >= 1920L * 1080 ->  8_000_000
-            pixels >= 1280L *  720 ->  4_000_000
-            else                   ->  2_000_000
+        // ── Inicializar encoder + muxer (se mantienen abiertos todo el tiempo) ─
+        val encoder = createEncoder(outW, outH, targetFps)
+        val muxer   = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var muxerTrack     = -1
+        var muxerStarted   = false
+        var presentationUs = 0L
+        val bufInfo        = MediaCodec.BufferInfo()
+
+        // ── Decodificador + streaming ─────────────────────────────────────────
+        val extractor   = MediaExtractor()
+        val decoder     = prepareDecoder(context, inputUri, extractor) ?: run {
+            encoder.stop(); encoder.release(); muxer.release()
+            return false
+        }
+        decoder.start()
+
+        // Estimamos el total de frames para el progreso
+        val totalFrames = (meta.durationMs / 1000.0 * srcFps).toLong().coerceAtLeast(1)
+        var decodedFrames = 0L
+        var decoderEos    = false
+        var inputEos      = false
+
+        // Mantemos el Mat del frame ANTERIOR para calcular el flow entre pares
+        var prevMat: Mat? = null
+        var prevPts: Long = 0L
+
+        try {
+            while (!decoderEos) {
+                // ── Alimentar el decodificador ────────────────────────────────
+                if (!inputEos) {
+                    val inIdx = decoder.dequeueInputBuffer(TIMEOUT_US)
+                    if (inIdx >= 0) {
+                        val buf  = decoder.getInputBuffer(inIdx)!!
+                        val size = extractor.readSampleData(buf, 0)
+                        if (size < 0) {
+                            decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputEos = true
+                        } else {
+                            decoder.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+
+                // ── Obtener frame decodificado ────────────────────────────────
+                val outIdx = decoder.dequeueOutputBuffer(bufInfo, TIMEOUT_US)
+                if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) continue
+                if (outIdx < 0) continue
+
+                if (bufInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                    decoder.releaseOutputBuffer(outIdx, false)
+                    decoderEos = true
+                    // Escribir el último frame pendiente sin interpolar
+                    prevMat?.let { m ->
+                        val bmp = matToBitmap(m, outW, outH)
+                        writeFrameToEncoder(bmp, encoder, muxer, bufInfo, outW, outH,
+                            presentationUs, frameDurUs,
+                            { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+                            muxerTrack, muxerStarted
+                        )
+                        presentationUs += frameDurUs
+                        bmp.recycle()
+                        m.release()
+                        prevMat = null
+                    }
+                    break
+                }
+
+                val image = decoder.getOutputImage(outIdx)
+                decoder.releaseOutputBuffer(outIdx, false)
+                if (image == null) continue
+
+                val currMat = imageToMat(image, srcW, srcH)
+                image.close()
+                if (currMat == null) continue
+
+                decodedFrames++
+                val prog = ((decodedFrames.toFloat() / totalFrames) * 90).toInt().coerceIn(0, 90)
+                onProgress(prog)
+
+                val curr = prevMat
+                if (curr == null) {
+                    // Primer frame: solo guardar como previo
+                    prevMat = currMat
+                    prevPts = bufInfo.presentationTimeUs
+                    continue
+                }
+
+                // ── Tenemos un par (curr=previo, currMat=actual) ─────────────
+                // 1. Escribir el frame ANTERIOR (original) al encoder
+                val bmpA = matToBitmap(curr, outW, outH)
+                writeFrameToEncoder(bmpA, encoder, muxer, bufInfo, outW, outH,
+                    presentationUs, frameDurUs,
+                    { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+                    muxerTrack, muxerStarted
+                )
+                presentationUs += frameDurUs
+                bmpA.recycle()
+
+                // 2. Calcular optical flow (a baja resolución) entre curr y currMat
+                if (interpFactor > 1 && !isSceneCut(curr, currMat)) {
+                    val flow = computeFlowLowRes(curr, currMat)
+
+                    // 3. Generar (interpFactor-1) frames interpolados
+                    for (k in 1 until interpFactor) {
+                        val alpha = k.toFloat() / interpFactor
+                        val interpolated = warpAndBlend(curr, currMat, flow, alpha, outW, outH)
+                        writeFrameToEncoder(interpolated, encoder, muxer, bufInfo, outW, outH,
+                            presentationUs, frameDurUs,
+                            { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+                            muxerTrack, muxerStarted
+                        )
+                        presentationUs += frameDurUs
+                        interpolated.recycle()
+                    }
+                    flow.release()
+                }
+
+                // 4. Liberar el Mat anterior y avanzar
+                curr.release()
+                prevMat = currMat
+                prevPts = bufInfo.presentationTimeUs
+            }
+        } finally {
+            prevMat?.release()
+            decoder.stop()
+            decoder.release()
+            extractor.release()
         }
 
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
+        // ── Señal EOS al encoder ──────────────────────────────────────────────
+        flushEncoder(encoder, muxer, bufInfo,
+            { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+            muxerTrack, muxerStarted, presentationUs
+        )
+
+        encoder.stop()
+        encoder.release()
+        if (muxerStarted) { try { muxer.stop() } catch (_: Exception) {} }
+        muxer.release()
+
+        onProgress(100)
+        val ok = outputFile.exists() && outputFile.length() > 0
+        Log.d(TAG, "Interpolación finalizada: ok=$ok, size=${outputFile.length()} bytes")
+        return ok
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // INTERNAL HELPERS
+    // ──────────────────────────────────────────────────────────────────────────
+
+    private data class VideoMeta(
+        val fps: Int, val width: Int, val height: Int, val durationMs: Long
+    )
+
+    private fun readVideoMeta(context: Context, uri: Uri): VideoMeta {
+        val r = MediaMetadataRetriever()
+        return try {
+            r.setDataSource(context, uri)
+            val fps = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                ?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 } ?: 30
+            val w   = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull()?.takeIf { it > 0 } ?: 1280
+            val h   = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                ?.toIntOrNull()?.takeIf { it > 0 } ?: 720
+            val ms  = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                ?.toLongOrNull() ?: 0L
+            VideoMeta(fps, w, h, ms)
+        } catch (_: Exception) {
+            VideoMeta(30, 1280, 720, 0L)
+        } finally {
+            r.release()
+        }
+    }
+
+    private fun createEncoder(w: Int, h: Int, fps: Int): MediaCodec {
+        val pixels  = w.toLong() * h
+        val bitRate = when {
+            pixels >= 3840L * 2160 -> 12_000_000
+            pixels >= 1920L * 1080 ->  6_000_000
+            pixels >= 1280L *  720 ->  3_000_000
+            else                   ->  1_500_000
+        }
+        val fmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, w, h).apply {
             setInteger(MediaFormat.KEY_BIT_RATE,         bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE,       fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         }
+        val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        enc.configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        enc.start()
+        return enc
+    }
 
-        val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-        encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        encoder.start()
-
-        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        var muxerTrack = -1
-        var muxerStarted = false
-        var presentationTimeUs = 0L
-        val bufferInfo = MediaCodec.BufferInfo()
-
-        for ((idx, bmp) in frames.withIndex()) {
-            // Enviar frame al encoder
-            val inputIdx = encoder.dequeueInputBuffer(TIMEOUT_US)
-            if (inputIdx >= 0) {
-                val inputBuf = encoder.getInputBuffer(inputIdx)!!
-                inputBuf.clear()
-                val yuv = bitmapToYuv420(bmp, w, h)
-                inputBuf.put(yuv)
-                encoder.queueInputBuffer(inputIdx, 0, yuv.size, presentationTimeUs, 0)
-                presentationTimeUs += frameDurationUs
+    /** Configura MediaExtractor + MediaCodec decoder para el track de video. */
+    private fun prepareDecoder(
+        context: Context, uri: Uri, extractor: MediaExtractor
+    ): MediaCodec? {
+        extractor.setDataSource(context, uri, null)
+        var videoFmt: MediaFormat? = null
+        for (i in 0 until extractor.trackCount) {
+            val fmt = extractor.getTrackFormat(i)
+            if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                extractor.selectTrack(i)
+                videoFmt = fmt
+                break
             }
+        }
+        if (videoFmt == null) return null
+        val mime    = videoFmt.getString(MediaFormat.KEY_MIME) ?: return null
+        val decoder = MediaCodec.createDecoderByType(mime)
+        decoder.configure(videoFmt, null, null, 0)
+        return decoder
+    }
 
-            // Drenar encoder
-            drainEncoder(encoder, muxer, bufferInfo, {
-                if (muxerTrack < 0) {
-                    muxerTrack = muxer.addTrack(it)
-                    muxer.start()
-                    muxerStarted = true
-                }
-            }, muxerTrack, muxerStarted)
+    // ── Convertir Image (YUV_420_888) → RGBA Mat sin pasar por JPEG ──────────
 
-            val prog = 70 + (idx.toFloat() / frames.size * 25).toInt()
-            onProgress(prog)
+    private fun imageToMat(image: android.media.Image, targetW: Int, targetH: Int): Mat? {
+        return try {
+            val yPlane = image.planes[0]
+            val uPlane = image.planes[1]
+            val vPlane = image.planes[2]
+
+            val yBuf = yPlane.buffer
+            val uBuf = uPlane.buffer
+            val vBuf = vPlane.buffer
+
+            // Construir NV21 con los planos yuv
+            val ySize = yBuf.remaining()
+            val uSize = uBuf.remaining()
+            val vSize = vBuf.remaining()
+            val nv21  = ByteArray(ySize + uSize + vSize)
+            yBuf.get(nv21, 0, ySize)
+            vBuf.get(nv21, ySize, vSize)
+            uBuf.get(nv21, ySize + vSize, uSize)
+
+            // NV21 → Mat BGRA vía OpenCV
+            val nv21Mat = Mat(image.height + image.height / 2, image.width, CvType.CV_8UC1)
+            nv21Mat.put(0, 0, nv21)
+            val rgbaMat = Mat()
+            org.opencv.imgproc.Imgproc.cvtColor(nv21Mat, rgbaMat, org.opencv.imgproc.Imgproc.COLOR_YUV2RGBA_NV21)
+            nv21Mat.release()
+
+            // Escalar si hace falta
+            val result = if (rgbaMat.cols() == targetW && rgbaMat.rows() == targetH) {
+                rgbaMat
+            } else {
+                val scaled = Mat()
+                org.opencv.imgproc.Imgproc.resize(rgbaMat, scaled, Size(targetW.toDouble(), targetH.toDouble()))
+                rgbaMat.release()
+                scaled
+            }
+            result
+        } catch (e: Exception) {
+            Log.w(TAG, "imageToMat error: ${e.message}")
+            null
+        }
+    }
+
+    private fun matToBitmap(mat: Mat, w: Int, h: Int): Bitmap {
+        val target = if (mat.cols() == w && mat.rows() == h) mat
+        else {
+            val r = Mat()
+            org.opencv.imgproc.Imgproc.resize(mat, r, Size(w.toDouble(), h.toDouble()))
+            r
+        }
+        val bmp = Bitmap.createBitmap(target.cols(), target.rows(), Bitmap.Config.ARGB_8888)
+        Utils.matToBitmap(target, bmp)
+        if (target !== mat) target.release()
+        return bmp
+    }
+
+    // ── Optical flow a baja resolución (vectorizado, sin bucle pixel) ─────────
+
+    /**
+     * Calcula el optical flow Farneback entre [a] y [b].
+     * Para reducir el tiempo de cómputo, ambos se escalan a ≤480×270 antes de Farneback,
+     * y el flow resultante se re-escala en coordenadas al tamaño real.
+     * El Mat devuelto tiene el mismo tamaño que [a] y [b], tipo CV_32FC2.
+     */
+    private fun computeFlowLowRes(a: Mat, b: Mat): Mat {
+        val srcW  = a.cols(); val srcH = a.rows()
+        val scale = minOf(FLOW_MAX_W.toDouble() / srcW, FLOW_MAX_H.toDouble() / srcH, 1.0)
+        val flowW = (srcW * scale).toInt().coerceAtLeast(16)
+        val flowH = (srcH * scale).toInt().coerceAtLeast(9)
+
+        // Escalar ambos frames a resolución de flow
+        val smallA = Mat(); val smallB = Mat()
+        org.opencv.imgproc.Imgproc.resize(a, smallA, Size(flowW.toDouble(), flowH.toDouble()))
+        org.opencv.imgproc.Imgproc.resize(b, smallB, Size(flowW.toDouble(), flowH.toDouble()))
+
+        // Convertir a escala de grises
+        val grayA = Mat(); val grayB = Mat()
+        org.opencv.imgproc.Imgproc.cvtColor(smallA, grayA, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+        org.opencv.imgproc.Imgproc.cvtColor(smallB, grayB, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+        smallA.release(); smallB.release()
+
+        // Farneback con parámetros conservadores (velocidad > calidad)
+        // pyr_scale=0.5, levels=2, winsize=9, iterations=2, poly_n=5, poly_sigma=1.1
+        val flowSmall = Mat()
+        Video.calcOpticalFlowFarneback(grayA, grayB, flowSmall,
+            0.5, 2, 9, 2, 5, 1.1, 0)
+        grayA.release(); grayB.release()
+
+        // Re-escalar el flow al tamaño original
+        val flow = if (scale < 1.0) {
+            val bigFlow = Mat()
+            org.opencv.imgproc.Imgproc.resize(flowSmall, bigFlow, Size(srcW.toDouble(), srcH.toDouble()))
+            flowSmall.release()
+            // Escalar los valores de desplazamiento proporcionalmente
+            Core.multiply(bigFlow, Scalar(1.0 / scale, 1.0 / scale), bigFlow)
+            bigFlow
+        } else {
+            flowSmall
+        }
+        return flow
+    }
+
+    // ── Warp bidireccional + blend (vectorizado con OpenCV) ───────────────────
+
+    /**
+     * Genera el frame en la posición [alpha] ∈ (0,1) entre [a] y [b].
+     * Construye los mapas de remapeo usando operaciones matriciales de OpenCV
+     * (no hay bucles pixel a pixel → rendimiento de C++ nativo).
+     */
+    private fun warpAndBlend(
+        a: Mat, b: Mat, flow: Mat,
+        alpha: Float, outW: Int, outH: Int
+    ): Bitmap {
+        val h = a.rows(); val w = a.cols()
+
+        // ── Construir coordenadas base (grid x,y) ─────────────────────────────
+        // baseX(r,c) = c,  baseY(r,c) = r  (tipo CV_32F)
+        val baseX = Mat(h, w, CvType.CV_32FC1)
+        val baseY = Mat(h, w, CvType.CV_32FC1)
+        for (row in 0 until h) {
+            val rowDataX = FloatArray(w) { col -> col.toFloat() }
+            val rowDataY = FloatArray(w) { row.toFloat() }
+            baseX.put(row, 0, rowDataX)
+            baseY.put(row, 0, rowDataY)
         }
 
-        // Señal de fin de stream
-        val eosIdx = encoder.dequeueInputBuffer(TIMEOUT_US)
+        // Separar los canales del flow (dx, dy)
+        val flowChannels = mutableListOf<Mat>()
+        Core.split(flow, flowChannels)
+        val flowDx = flowChannels[0]
+        val flowDy = flowChannels[1]
+
+        // mapXf = baseX + alpha * flowDx
+        val mapXf = Mat(); val mapYf = Mat()
+        Core.scaleAdd(flowDx, alpha.toDouble(), baseX, mapXf)
+        Core.scaleAdd(flowDy, alpha.toDouble(), baseY, mapYf)
+
+        // mapXb = baseX - (1-alpha) * flowDx
+        val mapXb = Mat(); val mapYb = Mat()
+        Core.scaleAdd(flowDx, -(1.0 - alpha).toDouble(), baseX, mapXb)
+        Core.scaleAdd(flowDy, -(1.0 - alpha).toDouble(), baseY, mapYb)
+
+        baseX.release(); baseY.release()
+        flowDx.release(); flowDy.release()
+
+        // Remap
+        val warpedA = Mat(); val warpedB = Mat()
+        org.opencv.imgproc.Imgproc.remap(a, warpedA, mapXf, mapYf,
+            org.opencv.imgproc.Imgproc.INTER_LINEAR)
+        org.opencv.imgproc.Imgproc.remap(b, warpedB, mapXb, mapYb,
+            org.opencv.imgproc.Imgproc.INTER_LINEAR)
+        mapXf.release(); mapYf.release(); mapXb.release(); mapYb.release()
+
+        // Blend
+        val blended = Mat()
+        Core.addWeighted(warpedA, (1.0 - alpha).toDouble(), warpedB, alpha.toDouble(), 0.0, blended)
+        warpedA.release(); warpedB.release()
+
+        val result = matToBitmap(blended, outW, outH)
+        blended.release()
+        return result
+    }
+
+    // ── Detección de corte de escena (sampling vectorizado) ───────────────────
+
+    /**
+     * Devuelve true si la diferencia media de luminancia entre [a] y [b] supera el umbral.
+     * Usa una versión muy reducida de ambos frames (32×18) para máxima velocidad.
+     */
+    private fun isSceneCut(a: Mat, b: Mat): Boolean {
+        return try {
+            val thumb = Size(32.0, 18.0)
+            val ta = Mat(); val tb = Mat()
+            org.opencv.imgproc.Imgproc.resize(a, ta, thumb)
+            org.opencv.imgproc.Imgproc.resize(b, tb, thumb)
+            val ga = Mat(); val gb = Mat()
+            org.opencv.imgproc.Imgproc.cvtColor(ta, ga, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+            org.opencv.imgproc.Imgproc.cvtColor(tb, gb, org.opencv.imgproc.Imgproc.COLOR_RGBA2GRAY)
+            ta.release(); tb.release()
+            val diff = Mat()
+            Core.absdiff(ga, gb, diff)
+            ga.release(); gb.release()
+            val mean = Core.mean(diff)
+            diff.release()
+            mean.`val`[0] > 60.0
+        } catch (_: Exception) { false }
+    }
+
+    // ── Escribir un frame Bitmap al encoder + muxer ───────────────────────────
+
+    private fun writeFrameToEncoder(
+        bmp:            Bitmap,
+        encoder:        MediaCodec,
+        muxer:          MediaMuxer,
+        bufInfo:        MediaCodec.BufferInfo,
+        w:              Int,
+        h:              Int,
+        presentationUs: Long,
+        frameDurUs:     Long,
+        onTrackAdded:   (Int) -> Unit,
+        muxerTrack:     Int,
+        muxerStarted:   Boolean
+    ) {
+        var track = muxerTrack
+        var started = muxerStarted
+
+        val inIdx = encoder.dequeueInputBuffer(TIMEOUT_US * 5)
+        if (inIdx >= 0) {
+            val buf = encoder.getInputBuffer(inIdx)!!
+            buf.clear()
+            val yuv = bitmapToNv12(bmp, w, h)
+            buf.put(yuv)
+            encoder.queueInputBuffer(inIdx, 0, yuv.size, presentationUs, 0)
+        }
+
+        // Drenar output del encoder
+        var outIdx = encoder.dequeueOutputBuffer(bufInfo, 0)
+        while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                if (track < 0) {
+                    track = muxer.addTrack(encoder.outputFormat)
+                    onTrackAdded(track)
+                    muxer.start()
+                    started = true
+                }
+            } else if (outIdx >= 0) {
+                if (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 &&
+                    started && track >= 0
+                ) {
+                    val buf = encoder.getOutputBuffer(outIdx)!!
+                    muxer.writeSampleData(track, buf, bufInfo)
+                }
+                encoder.releaseOutputBuffer(outIdx, false)
+            }
+            outIdx = encoder.dequeueOutputBuffer(bufInfo, 0)
+        }
+    }
+
+    private fun flushEncoder(
+        encoder:        MediaCodec,
+        muxer:          MediaMuxer,
+        bufInfo:        MediaCodec.BufferInfo,
+        onTrackAdded:   (Int) -> Unit,
+        muxerTrackIn:   Int,
+        muxerStartedIn: Boolean,
+        presentationUs: Long
+    ) {
+        var muxerTrack   = muxerTrackIn
+        var muxerStarted = muxerStartedIn
+
+        val eosIdx = encoder.dequeueInputBuffer(TIMEOUT_US * 5)
         if (eosIdx >= 0) {
-            encoder.queueInputBuffer(eosIdx, 0, 0, presentationTimeUs,
+            encoder.queueInputBuffer(eosIdx, 0, 0, presentationUs,
                 MediaCodec.BUFFER_FLAG_END_OF_STREAM)
         }
-
-        // Drenar hasta EOS
         var eos = false
         while (!eos) {
-            val outIdx = encoder.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+            val outIdx = encoder.dequeueOutputBuffer(bufInfo, TIMEOUT_US)
             when {
                 outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     if (muxerTrack < 0) {
                         muxerTrack = muxer.addTrack(encoder.outputFormat)
+                        onTrackAdded(muxerTrack)
                         muxer.start()
                         muxerStarted = true
                     }
                 }
                 outIdx >= 0 -> {
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        encoder.releaseOutputBuffer(outIdx, false)
-                    } else {
+                    if (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 &&
+                        muxerStarted && muxerTrack >= 0
+                    ) {
                         val buf = encoder.getOutputBuffer(outIdx)!!
-                        if (muxerStarted && muxerTrack >= 0)
-                            muxer.writeSampleData(muxerTrack, buf, bufferInfo)
-                        encoder.releaseOutputBuffer(outIdx, false)
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0)
-                            eos = true
+                        muxer.writeSampleData(muxerTrack, buf, bufInfo)
                     }
+                    encoder.releaseOutputBuffer(outIdx, false)
+                    if (bufInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) eos = true
                 }
             }
         }
-
-        encoder.stop(); encoder.release()
-        if (muxerStarted) muxer.stop()
-        muxer.release()
-        onProgress(100)
-        return outputFile.exists() && outputFile.length() > 0
     }
 
-    private fun drainEncoder(
-        encoder: MediaCodec,
-        muxer: MediaMuxer,
-        bufferInfo: MediaCodec.BufferInfo,
-        onFormatChanged: (MediaFormat) -> Unit,
-        muxerTrack: Int,
-        muxerStarted: Boolean
-    ) {
-        var outIdx = encoder.dequeueOutputBuffer(bufferInfo, 0)
-        while (outIdx >= 0 || outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-            if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                onFormatChanged(encoder.outputFormat)
-            } else if (outIdx >= 0) {
-                if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                    val buf = encoder.getOutputBuffer(outIdx)!!
-                    if (muxerStarted && muxerTrack >= 0)
-                        muxer.writeSampleData(muxerTrack, buf, bufferInfo)
-                }
-                encoder.releaseOutputBuffer(outIdx, false)
-            }
-            outIdx = encoder.dequeueOutputBuffer(bufferInfo, 0)
-        }
-    }
+    // ── Bitmap ARGB_8888 → NV12 (YUV420 semi-planar) ─────────────────────────
 
-    // ── Convertir Bitmap ARGB_8888 → YUV 420 Flexible (NV12) ─────────────────
-
-    private fun bitmapToYuv420(bmp: Bitmap, w: Int, h: Int): ByteArray {
+    private fun bitmapToNv12(bmp: Bitmap, w: Int, h: Int): ByteArray {
         val pixels = IntArray(w * h)
         bmp.getPixels(pixels, 0, w, 0, 0, w, h)
-        val yuv = ByteArray(w * h * 3 / 2)
-        val uvOffset = w * h
-        var uvIdx = uvOffset
+        val nv12    = ByteArray(w * h * 3 / 2)
+        val uvStart = w * h
+        var uvIdx   = uvStart
         for (j in 0 until h) {
             for (i in 0 until w) {
                 val p = pixels[j * w + i]
                 val r = (p shr 16) and 0xFF
                 val g = (p shr 8)  and 0xFF
                 val b =  p         and 0xFF
-                val y = ((66 * r + 129 * g + 25 * b + 128) shr 8) + 16
-                yuv[j * w + i] = y.coerceIn(0, 255).toByte()
-                if (j % 2 == 0 && i % 2 == 0) {
-                    val u = ((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128
-                    val v = ((112 * r - 94 * g - 18 * b + 128) shr 8) + 128
-                    yuv[uvIdx++] = u.coerceIn(0, 255).toByte()
-                    yuv[uvIdx++] = v.coerceIn(0, 255).toByte()
+                nv12[j * w + i] = (((66 * r + 129 * g + 25 * b + 128) shr 8) + 16)
+                    .coerceIn(0, 255).toByte()
+                if (j % 2 == 0 && i % 2 == 0 && uvIdx + 1 < nv12.size) {
+                    nv12[uvIdx++] = (((-38 * r - 74 * g + 112 * b + 128) shr 8) + 128)
+                        .coerceIn(0, 255).toByte()
+                    nv12[uvIdx++] = (((112 * r - 94 * g - 18 * b + 128) shr 8) + 128)
+                        .coerceIn(0, 255).toByte()
                 }
             }
         }
-        return yuv
+        return nv12
     }
 }
