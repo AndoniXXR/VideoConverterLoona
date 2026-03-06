@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -98,12 +99,16 @@ class ConversionService : Service() {
         val requestId  = UUID.randomUUID().toString()
         currentRequestId = requestId
 
+        // Forzar transcodificación explícita H.264/AAC para compatibilidad universal.
+        // El passthrough (null,null) falla en videos HEVC/H.265 que graban los móviles modernos.
+        val (targetVideoFormat, targetAudioFormat) = buildTargetFormats(inputUri, format)
+
         transformer?.transform(
             requestId,
             inputUri,
             outputPath,
-            null,   // targetVideoFormat: null = mismo formato que el origen
-            null,   // targetAudioFormat: null = mismo formato que el origen
+            targetVideoFormat,
+            targetAudioFormat,
             object : TransformationListener {
                 override fun onStarted(id: String) {
                     _state.value = ConversionState(isConverting = true, progress = 1)
@@ -238,5 +243,60 @@ class ConversionService : Service() {
     private fun stopAndReturn(): Int {
         stopSelf()
         return START_NOT_STICKY
+    }
+
+    /**
+     * Lee las dimensiones reales del video con MediaMetadataRetriever y construye
+     * MediaFormat explícitos para la transcodificación.
+     * - mp4 / 3gp → H.264 (AVC) + AAC
+     * - webm       → VP8 + Vorbis
+     * Esto evita el error "failed to add track to the muxer" que ocurre cuando
+     * el origen es HEVC (H.265) y MediaMuxer no admite ese codec directamente.
+     */
+    private fun buildTargetFormats(inputUri: Uri, format: String): Pair<MediaFormat, MediaFormat> {
+        val retriever = MediaMetadataRetriever()
+        var width     = 1920
+        var height    = 1080
+        var frameRate = 30
+
+        try {
+            retriever.setDataSource(applicationContext, inputUri)
+            width  = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+                ?.toIntOrNull()?.takeIf { it > 0 } ?: 1920
+            height = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+                ?.toIntOrNull()?.takeIf { it > 0 } ?: 1080
+            // METADATA_KEY_CAPTURE_FRAMERATE (API 23+): puede devolver null en muchos dispositivos
+            val fpsStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+            val fps = fpsStr?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 }
+            if (fps != null) frameRate = fps
+        } catch (_: Exception) {
+            // si no se puede leer, usamos los defaults 1920x1080@30fps
+        } finally {
+            retriever.release()
+        }
+
+        val pixels = width * height
+        val videoBitRate = when {
+            pixels >= 3840 * 2160 -> 15_000_000  // 4K
+            pixels >= 1920 * 1080 ->  6_000_000  // 1080p
+            pixels >= 1280 *  720 ->  3_000_000  // 720p
+            else                  ->  1_500_000  // 480p o menos
+        }
+
+        val isWebm = format.equals("webm", ignoreCase = true)
+        val videoMime = if (isWebm) MediaFormat.MIMETYPE_VIDEO_VP8  else MediaFormat.MIMETYPE_VIDEO_AVC
+        val audioMime = if (isWebm) MediaFormat.MIMETYPE_AUDIO_VORBIS else MediaFormat.MIMETYPE_AUDIO_AAC
+
+        val videoFormat = MediaFormat.createVideoFormat(videoMime, width, height).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE,        videoBitRate)
+            setInteger(MediaFormat.KEY_FRAME_RATE,      frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
+
+        val audioFormat = MediaFormat.createAudioFormat(audioMime, 44100, 2).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, 128_000)
+        }
+
+        return Pair(videoFormat, audioFormat)
     }
 }
