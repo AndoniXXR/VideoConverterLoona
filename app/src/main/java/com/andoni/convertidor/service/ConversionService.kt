@@ -37,6 +37,7 @@ class ConversionService : Service() {
         const val EXTRA_DURATION_MS  = "duration_ms"
         const val EXTRA_TARGET_WIDTH  = "target_width"
         const val EXTRA_TARGET_HEIGHT = "target_height"
+        const val EXTRA_TARGET_FPS    = "target_fps"
 
         const val CHANNEL_ID             = "conversion_channel"
         const val CHANNEL_ALERT_ID       = "conversion_alert_channel"
@@ -90,7 +91,14 @@ class ConversionService : Service() {
         currentRequestId?.let { transformer?.cancel(it) }
 
         val hasResolutionChange = (intent?.getIntExtra(EXTRA_TARGET_WIDTH, -1) ?: -1) > 0
-        val notifTitle = if (hasResolutionChange) "Cambiando resolución…" else "Convirtiendo video…"
+        val targetFps = intent?.getIntExtra(EXTRA_TARGET_FPS, -1) ?: -1
+        val hasFpsChange = targetFps > 0
+        val notifTitle = when {
+            hasFpsChange && hasResolutionChange -> "Cambiando resolución y FPS…"
+            hasFpsChange                        -> "Interpolando FPS…"
+            hasResolutionChange                 -> "Cambiando resolución…"
+            else                                -> "Convirtiendo video…"
+        }
         _notifTitle = notifTitle
         startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0, notifTitle))
         _state.value = ConversionState(isConverting = true, progress = 0)
@@ -107,16 +115,58 @@ class ConversionService : Service() {
         val requestId  = UUID.randomUUID().toString()
         currentRequestId = requestId
 
-        // Forzar transcodificación explícita H.264/AAC para compatibilidad universal.
-        // El passthrough (null,null) falla en videos HEVC/H.265 que graban los móviles modernos.
         val targetW = intent?.getIntExtra(EXTRA_TARGET_WIDTH,  -1) ?: -1
         val targetH = intent?.getIntExtra(EXTRA_TARGET_HEIGHT, -1) ?: -1
 
-        val (targetVideoFormat, targetAudioFormat) = buildTargetFormats(inputUri, format, targetW, targetH)
+        // ── Pipeline de FPS ──────────────────────────────────────────────────
+        // Si el usuario quiere subir FPS usamos FpsInterpolator (optical flow).
+        // Si quiere bajar FPS, LiTr lo maneja vía KEY_FRAME_RATE en buildTargetFormats.
+        // En ambos casos LiTr hace el transcode final de formato/resolución.
+        val litrInputUri: Uri
+        var tempInterpolatedFile: File? = null
+
+        val srcFps = run {
+            val r = MediaMetadataRetriever()
+            try {
+                r.setDataSource(applicationContext, inputUri)
+                r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
+                    ?.toFloatOrNull()?.toInt()?.takeIf { it in 1..120 } ?: 30
+            } catch (_: Exception) { 30 } finally { r.release() }
+        }
+
+        if (hasFpsChange && targetFps > srcFps && FpsInterpolator.isAvailable()) {
+            updateProgressNotification(0)
+            val tmpDir = cacheDir
+            val tmpFile = File(tmpDir, "fps_interp_${System.currentTimeMillis()}.mp4")
+            tempInterpolatedFile = tmpFile
+            val ok = FpsInterpolator.interpolate(
+                context       = applicationContext,
+                inputUri      = inputUri,
+                outputFile    = tmpFile,
+                targetFps     = targetFps,
+                targetWidth   = targetW,
+                targetHeight  = targetH,
+                onProgress    = { pct ->
+                    // Mapear 0..100 del interpolador a 0..60 del progreso total
+                    val mapped = (pct * 0.60).toInt()
+                    _state.value = _state.value.copy(progress = mapped)
+                    updateProgressNotification(mapped)
+                }
+            )
+            litrInputUri = if (ok && tmpFile.exists()) Uri.fromFile(tmpFile) else inputUri
+        } else {
+            litrInputUri = inputUri
+        }
+
+        // Forzar transcodificación explícita H.264/AAC para compatibilidad universal.
+        // El passthrough (null,null) falla en videos HEVC/H.265 que graban los móviles modernos.
+        val (targetVideoFormat, targetAudioFormat) = buildTargetFormats(
+            litrInputUri, format, targetW, targetH, targetFps
+        )
 
         transformer?.transform(
             requestId,
-            inputUri,
+            litrInputUri,
             outputPath,
             targetVideoFormat,
             targetAudioFormat,
@@ -125,11 +175,15 @@ class ConversionService : Service() {
                     _state.value = ConversionState(isConverting = true, progress = 1)
                 }
                 override fun onProgress(id: String, progress: Float) {
-                    val pct = (progress * 100).toInt().coerceIn(1, 99)
+                    // Si hubo interpolación previa ocupa 0..60; LiTr ocupa 60..100
+                    val base = if (tempInterpolatedFile != null) 60 else 0
+                    val span = if (tempInterpolatedFile != null) 40 else 100
+                    val pct = (base + progress * span).toInt().coerceIn(base + 1, 99)
                     _state.value = _state.value.copy(progress = pct)
                     updateProgressNotification(pct)
                 }
                 override fun onCompleted(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
+                    tempInterpolatedFile?.delete()
                     val savedUri = registerFileInMediaStore(outputPath, format)
                     _state.value = ConversionState(
                         isConverting = false,
@@ -142,11 +196,13 @@ class ConversionService : Service() {
                     stopSelf()
                 }
                 override fun onCancelled(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
+                    tempInterpolatedFile?.delete()
                     _state.value = ConversionState(error = "Conversión cancelada")
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
                 override fun onError(id: String, cause: Throwable?, trackTransformationInfos: List<TrackTransformationInfo>?) {
+                    tempInterpolatedFile?.delete()
                     _state.value = ConversionState(error = cause?.message ?: "Error desconocido durante la conversión")
                     showErrorNotification()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -295,7 +351,8 @@ class ConversionService : Service() {
         inputUri: Uri,
         format: String,
         targetWidth: Int = -1,
-        targetHeight: Int = -1
+        targetHeight: Int = -1,
+        targetFps: Int = -1
     ): Pair<MediaFormat, MediaFormat> {
         val retriever = MediaMetadataRetriever()
         var srcWidth  = 1920
@@ -320,6 +377,8 @@ class ConversionService : Service() {
         // Si el usuario especificó resolución destino, respetarla; si no, mantener la original
         val width  = if (targetWidth  > 0) targetWidth  else srcWidth
         val height = if (targetHeight > 0) targetHeight else srcHeight
+        // FPS: usar el especificado por el usuario, si no el del fuente
+        if (targetFps in 1..120) frameRate = targetFps
 
         val pixels = width.toLong() * height.toLong()
         val videoBitRate = when {

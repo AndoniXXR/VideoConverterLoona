@@ -69,6 +69,9 @@ dependencies {
     // LiTr (LinkedIn) — conversión y reparación de video con MediaCodec nativo
     implementation("com.linkedin.android.litr:litr:1.5.7")
 
+    // OpenCV Android — optical flow clásico (Farneback) para interpolación de FPS
+    implementation("org.opencv:opencv:4.11.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
