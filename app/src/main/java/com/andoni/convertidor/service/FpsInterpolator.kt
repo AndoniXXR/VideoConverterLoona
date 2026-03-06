@@ -143,7 +143,7 @@ object FpsInterpolator {
                         val bmp = matToBitmap(m, outW, outH)
                         writeFrameToEncoder(bmp, encoder, muxer, bufInfo, outW, outH,
                             presentationUs, frameDurUs,
-                            { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+                            { trk -> muxerTrack = trk; muxerStarted = true },
                             muxerTrack, muxerStarted
                         )
                         presentationUs += frameDurUs
@@ -179,7 +179,7 @@ object FpsInterpolator {
                 val bmpA = matToBitmap(curr, outW, outH)
                 writeFrameToEncoder(bmpA, encoder, muxer, bufInfo, outW, outH,
                     presentationUs, frameDurUs,
-                    { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+                    { trk -> muxerTrack = trk; muxerStarted = true },
                     muxerTrack, muxerStarted
                 )
                 presentationUs += frameDurUs
@@ -195,7 +195,7 @@ object FpsInterpolator {
                         val interpolated = warpAndBlend(curr, currMat, flow, alpha, outW, outH)
                         writeFrameToEncoder(interpolated, encoder, muxer, bufInfo, outW, outH,
                             presentationUs, frameDurUs,
-                            { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+                            { trk -> muxerTrack = trk; muxerStarted = true },
                             muxerTrack, muxerStarted
                         )
                         presentationUs += frameDurUs
@@ -218,7 +218,7 @@ object FpsInterpolator {
 
         // ── Señal EOS al encoder ──────────────────────────────────────────────
         flushEncoder(encoder, muxer, bufInfo,
-            { trk -> muxerTrack = trk; muxer.start(); muxerStarted = true },
+            { trk -> muxerTrack = trk; muxerStarted = true },
             muxerTrack, muxerStarted, presentationUs
         )
 

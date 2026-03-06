@@ -4,8 +4,58 @@
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Triángulo de play -->
+
+    <!-- Cuerpo de la claqueta (rectángulo principal) -->
     <path
         android:fillColor="#FFFFFF"
-        android:pathData="M40,30 L40,78 L80,54 Z" />
+        android:pathData="M22,42 L22,82 Q22,86 26,86 L82,86 Q86,86 86,82 L86,42 Z" />
+
+    <!-- Franja superior de la claqueta -->
+    <path
+        android:fillColor="#EDE7FF"
+        android:pathData="M22,34 L22,42 L86,42 L86,34 Q86,30 82,30 L26,30 Q22,30 22,34 Z" />
+
+    <!-- Dientes de la claqueta (diagonal izq) -->
+    <path
+        android:fillColor="#7C4DFF"
+        android:pathData="M26,30 L34,30 L26,42 Z" />
+    <path
+        android:fillColor="#7C4DFF"
+        android:pathData="M40,30 L50,30 L40,42 L30,42 Z" />
+    <path
+        android:fillColor="#7C4DFF"
+        android:pathData="M56,30 L66,30 L56,42 L46,42 Z" />
+    <path
+        android:fillColor="#7C4DFF"
+        android:pathData="M72,30 L82,30 L82,34 L72,42 L62,42 Z" />
+
+    <!-- Fondo interior de la claqueta (área de contenido) -->
+    <path
+        android:fillColor="#1A0A3E"
+        android:pathData="M24,43 L84,43 L84,84 L24,84 Z" />
+
+    <!-- Flecha circular de conversión -->
+    <!-- Arco superior izquierdo -->
+    <path
+        android:strokeColor="#7C4DFF"
+        android:strokeWidth="4"
+        android:fillColor="#00000000"
+        android:strokeLineCap="round"
+        android:pathData="M42,63 A12,12 0 1 1 66,63" />
+
+    <!-- Punta de flecha derecha (abajo) -->
+    <path
+        android:fillColor="#7C4DFF"
+        android:pathData="M63,56 L70,63 L63,70 Z" />
+
+    <!-- Punta de flecha izquierda (arriba) -->
+    <path
+        android:fillColor="#00C9A7"
+        android:pathData="M45,56 L38,63 L45,70 Z" />
+
+    <!-- Punto central decorativo -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,60 A3,3 0 1 1 54.001,60 Z" />
+
 </vector>

@@ -21,3 +21,8 @@ captures/
 # OS
 .DS_Store
 Thumbs.db
+
+# APK firmados/alineados generados localmente
+*.apk
+app-release-aligned*.apk
+app-release-signed*.apk
