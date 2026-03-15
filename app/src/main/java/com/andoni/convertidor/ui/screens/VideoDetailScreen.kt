@@ -28,6 +28,10 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.andoni.convertidor.data.FPS_PRESETS
 import com.andoni.convertidor.data.FpsOption
+import com.andoni.convertidor.data.GIF_FPS_PRESETS
+import com.andoni.convertidor.data.GIF_LOOP_PRESETS
+import com.andoni.convertidor.data.GIF_WIDTH_PRESETS
+import com.andoni.convertidor.data.GifOptions
 import com.andoni.convertidor.data.ResolutionOption
 import com.andoni.convertidor.data.VideoItem
 import com.andoni.convertidor.data.VideoRepository
@@ -52,6 +56,14 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
     val convState  by ConversionService.state.collectAsState()
 
     LaunchedEffect(videoId) { video = repository.getVideoById(videoId) }
+
+    // Volver al listado automáticamente tras conversión exitosa
+    LaunchedEffect(convState.isCompleted) {
+        if (convState.isCompleted) {
+            delay(800)
+            onBack()
+        }
+    }
 
     DisposableEffect(Unit) { onDispose { ConversionService.resetState() } }
 
@@ -96,7 +108,7 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                         video       = currentVideo,
                         convState   = convState,
                         scrollState = scrollState,
-                        onExport    = { outputName, format, isRepair, targetW, targetH, targetFps ->
+                        onExport    = { outputName, format, isRepair, targetW, targetH, targetFps, gifOpts ->
                             val path = FileUtils.buildOutputPath(context, outputName, format)
                             val intent = Intent(context, ConversionService::class.java).apply {
                                 putExtra(ConversionService.EXTRA_INPUT_URI,     currentVideo.uri.toString())
@@ -107,7 +119,15 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                                 if (targetW   > 0) putExtra(ConversionService.EXTRA_TARGET_WIDTH,  targetW)
                                 if (targetH   > 0) putExtra(ConversionService.EXTRA_TARGET_HEIGHT, targetH)
                                 if (targetFps > 0) putExtra(ConversionService.EXTRA_TARGET_FPS,    targetFps)
+                                if (gifOpts != null) {
+                                    putExtra(ConversionService.EXTRA_GIF_START_MS,    gifOpts.startMs)
+                                    putExtra(ConversionService.EXTRA_GIF_DURATION_MS, gifOpts.durationMs)
+                                    putExtra(ConversionService.EXTRA_GIF_FPS,         gifOpts.fps)
+                                    putExtra(ConversionService.EXTRA_GIF_WIDTH,       gifOpts.width)
+                                    putExtra(ConversionService.EXTRA_GIF_LOOP_COUNT,  gifOpts.loopCount)
+                                }
                             }
+                            ConversionService.setStartingState()
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
                                 context.startForegroundService(intent)
                             else
@@ -205,9 +225,9 @@ private fun ConversionCard(
     video:       VideoItem,
     convState:   ConversionService.ConversionState,
     scrollState: ScrollState,
-    onExport:    (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int) -> Unit
+    onExport:    (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int, gifOpts: GifOptions?) -> Unit
 ) {
-    val allFormats = listOf("mp4", "webm", "3gp")
+    val allFormats = listOf("mp4", "webm", "3gp", "gif")
     var selectedFormat by remember {
         mutableStateOf(allFormats.firstOrNull { it != video.extension } ?: "mp4")
     }
@@ -231,6 +251,14 @@ private fun ConversionCard(
         30
     }
 
+    // ── GIF ──
+    val videoDurationMs = video.duration.coerceAtLeast(1000L)
+    var gifStartSec by remember { mutableStateOf(0f) }
+    var gifDurationSec by remember { mutableStateOf(5f.coerceAtMost(videoDurationMs / 1000f)) }
+    var gifFps by remember { mutableStateOf(10) }
+    var gifWidth by remember { mutableStateOf(320) }
+    var gifLoopCount by remember { mutableStateOf(0) }
+
     // ── Diálogos ──
     var showSameFormatDialog  by remember { mutableStateOf(false) }
     var showConfirmDialog     by remember { mutableStateOf(false) }
@@ -243,6 +271,17 @@ private fun ConversionCard(
     var pendingTargetFps  by remember { mutableStateOf(-1) }
 
     fun launchExport(name: String, fmt: String, repair: Boolean, tW: Int, tH: Int, tFps: Int) {
+        if (fmt == "gif") {
+            val opts = GifOptions(
+                startMs    = (gifStartSec * 1000).toLong(),
+                durationMs = (gifDurationSec * 1000).toLong(),
+                fps        = gifFps,
+                width      = gifWidth,
+                loopCount  = gifLoopCount
+            )
+            onExport(name, fmt, false, -1, -1, -1, opts)
+            return
+        }
         val hasAnyChange = (tW > 0 && tH > 0) || tFps > 0
         if (hasAnyChange) {
             pendingOutputName = name
@@ -253,7 +292,7 @@ private fun ConversionCard(
             pendingTargetFps  = tFps
             showConfirmDialog = true
         } else {
-            onExport(name, fmt, repair, -1, -1, -1)
+            onExport(name, fmt, repair, -1, -1, -1, null)
         }
     }
 
@@ -315,8 +354,98 @@ private fun ConversionCard(
 
             HorizontalDivider()
 
-            // ── Sección de ajuste de FPS ──
-            Row(
+            if (selectedFormat == "gif" && !isRepair) {
+                // ── Sección de configuración GIF ──
+                Text("Configuración del GIF",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold)
+
+                // Inicio (segundos)
+                val maxStartSec = (videoDurationMs / 1000f - 0.5f).coerceAtLeast(0f)
+                Text("Inicio: ${String.format("%.1f", gifStartSec)}s",
+                    style = MaterialTheme.typography.bodyMedium)
+                Slider(
+                    value = gifStartSec,
+                    onValueChange = {
+                        gifStartSec = it
+                        // Ajustar duración si se excede
+                        val remaining = videoDurationMs / 1000f - it
+                        if (gifDurationSec > remaining) gifDurationSec = remaining.coerceAtLeast(0.5f)
+                    },
+                    valueRange = 0f..maxStartSec,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // Duración (segundos)
+                val maxDurSec = (videoDurationMs / 1000f - gifStartSec).coerceAtLeast(0.5f)
+                Text("Duración: ${String.format("%.1f", gifDurationSec)}s",
+                    style = MaterialTheme.typography.bodyMedium)
+                Slider(
+                    value = gifDurationSec,
+                    onValueChange = { gifDurationSec = it },
+                    valueRange = 0.5f..maxDurSec,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                // FPS
+                Text("Velocidad (FPS)", style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    GIF_FPS_PRESETS.forEach { fps ->
+                        FilterChip(
+                            selected = gifFps == fps,
+                            onClick  = { gifFps = fps },
+                            label    = { Text("$fps") }
+                        )
+                    }
+                }
+
+                // Resolución (ancho)
+                Text("Resolución", style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    GIF_WIDTH_PRESETS.forEach { (w, label) ->
+                        FilterChip(
+                            selected = gifWidth == w,
+                            onClick  = { gifWidth = w },
+                            label    = { Text(label) }
+                        )
+                    }
+                }
+
+                // Repeticiones
+                Text("Repeticiones", style = MaterialTheme.typography.bodyMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    GIF_LOOP_PRESETS.forEach { (count, label) ->
+                        FilterChip(
+                            selected = gifLoopCount == count,
+                            onClick  = { gifLoopCount = count },
+                            label    = { Text(label) }
+                        )
+                    }
+                }
+
+                // Estimación de frames
+                val estFrames = ((gifDurationSec * gifFps).toInt()).coerceAtLeast(1)
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                    )
+                ) {
+                    Column(modifier = Modifier.padding(12.dp),
+                           verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Resumen del GIF:",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold)
+                        Text("• Frames: ~$estFrames",
+                            style = MaterialTheme.typography.labelSmall)
+                        Text("• Tamaño: ${gifWidth}px de ancho",
+                            style = MaterialTheme.typography.labelSmall)
+                        Text("• Rango: ${String.format("%.1f", gifStartSec)}s – ${String.format("%.1f", gifStartSec + gifDurationSec)}s",
+                            style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            } else {
+                // ── Sección de ajuste de FPS ──
+                Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
@@ -497,7 +626,8 @@ private fun ConversionCard(
                             style = MaterialTheme.typography.labelSmall)
                     }
                 }
-            }
+                }
+            } // end else (FPS + Resolution sections)
 
             // ── Nombre del archivo de salida ──
             OutlinedTextField(
@@ -581,6 +711,7 @@ private fun ConversionCard(
             val hasFps = tFps > 0
             val buttonLabel = when {
                 isRepair                       -> "Reparar video"
+                selectedFormat == "gif"        -> "Crear GIF"
                 hasRes && hasFps               -> "Exportar · ${selectedPreset!!.label} · ${tFps}fps"
                 hasRes                         -> "Exportar a ${selectedPreset!!.label}"
                 hasFps                         -> "Exportar a ${tFps}fps"
@@ -590,8 +721,9 @@ private fun ConversionCard(
             Button(
                 onClick = {
                     focusManager.clearFocus()
-                    // Mostrar diálogo de mismo formato solo si NO hay cambios de resolución ni FPS
-                    if (!isRepair && selectedFormat == video.extension && !hasRes && !hasFps) {
+                    if (selectedFormat == "gif") {
+                        launchExport(outputName.trim(), "gif", false, -1, -1, -1)
+                    } else if (!isRepair && selectedFormat == video.extension && !hasRes && !hasFps) {
                         showSameFormatDialog = true
                     } else {
                         val fmt = if (isRepair) video.extension else selectedFormat
@@ -624,7 +756,7 @@ private fun ConversionCard(
                         Button(onClick = {
                             showSameFormatDialog = false
                             isRepair = true
-                            onExport(outputName.trim(), video.extension, true, -1, -1, -1)
+                            onExport(outputName.trim(), video.extension, true, -1, -1, -1, null)
                         }) { Text("Reparar video") }
                     },
                     dismissButton = {
@@ -689,7 +821,7 @@ private fun ConversionCard(
                         Button(onClick = {
                             showConfirmDialog = false
                             onExport(pendingOutputName, pendingFormat, pendingIsRepair,
-                                     pendingTargetW, pendingTargetH, pendingTargetFps)
+                                     pendingTargetW, pendingTargetH, pendingTargetFps, null)
                         }) { Text("Sí, continuar") }
                     },
                     dismissButton = {

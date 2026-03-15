@@ -6,6 +6,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.ContentValues
 import android.content.Intent
+import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -17,7 +18,11 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 import android.provider.MediaStore
+import android.view.Surface
 import androidx.core.app.NotificationCompat
 import com.andoni.convertidor.MainActivity
 import com.linkedin.android.litr.MediaTransformer
@@ -43,6 +48,13 @@ class ConversionService : Service() {
         const val EXTRA_TARGET_HEIGHT = "target_height"
         const val EXTRA_TARGET_FPS    = "target_fps"
 
+        // GIF-specific extras
+        const val EXTRA_GIF_START_MS    = "gif_start_ms"
+        const val EXTRA_GIF_DURATION_MS = "gif_duration_ms"
+        const val EXTRA_GIF_FPS         = "gif_fps"
+        const val EXTRA_GIF_WIDTH       = "gif_width"
+        const val EXTRA_GIF_LOOP_COUNT  = "gif_loop_count"
+
         const val CHANNEL_ID             = "conversion_channel"
         const val CHANNEL_ALERT_ID       = "conversion_alert_channel"
         const val NOTIF_PROGRESS_ID      = 1001
@@ -54,6 +66,7 @@ class ConversionService : Service() {
         val state = _state.asStateFlow()
 
         fun resetState() { _state.value = ConversionState() }
+        fun setStartingState() { _state.value = ConversionState(isConverting = true, progress = 0) }
     }
 
     data class ConversionState(
@@ -100,6 +113,7 @@ class ConversionService : Service() {
         val targetFps = intent?.getIntExtra(EXTRA_TARGET_FPS, -1) ?: -1
         val hasFpsChange = targetFps > 0
         val notifTitle = when {
+            format == "gif"                     -> "Creando GIF…"
             hasFpsChange && hasResolutionChange -> "Cambiando resolución y FPS…"
             hasFpsChange                        -> "Interpolando FPS…"
             hasResolutionChange                 -> "Cambiando resolución…"
@@ -124,6 +138,31 @@ class ConversionService : Service() {
 
         val targetW = intent.getIntExtra(EXTRA_TARGET_WIDTH,  -1)
         val targetH = intent.getIntExtra(EXTRA_TARGET_HEIGHT, -1)
+
+        // ── Pipeline GIF ───────────────────────────────────────────────────
+        if (format == "gif") {
+            val gifStartMs    = intent.getLongExtra(EXTRA_GIF_START_MS, 0L)
+            val gifDurationMs = intent.getLongExtra(EXTRA_GIF_DURATION_MS, 5000L)
+            val gifFps        = intent.getIntExtra(EXTRA_GIF_FPS, 10)
+            val gifWidth      = intent.getIntExtra(EXTRA_GIF_WIDTH, 320)
+            val gifLoopCount  = intent.getIntExtra(EXTRA_GIF_LOOP_COUNT, 0)
+
+            _notifTitle = "Creando GIF…"
+            updateProgressNotification(0)
+
+            Thread {
+                try {
+                    convertToGif(inputUri, outputPath, gifStartMs, gifDurationMs, gifFps, gifWidth, gifLoopCount)
+                } catch (e: Exception) {
+                    android.util.Log.e("ConversionService", "GIF conversion failed", e)
+                    _state.value = ConversionState(error = e.message ?: "Error al crear GIF")
+                    showErrorNotification()
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            }.apply { name = "gif-encoder"; isDaemon = true; start() }
+            return START_NOT_STICKY
+        }
 
         // ── Pipeline de FPS ────────────────────────────────────────────────
 
@@ -206,6 +245,7 @@ class ConversionService : Service() {
                                 outputPath   = capturedOutputPath,
                                 isCompleted  = true
                             )
+                            vibrateOnCompletion()
                             showCompletionNotification(capturedOutputPath, savedUri)
                             stopForeground(STOP_FOREGROUND_REMOVE)
                             stopSelf()
@@ -279,6 +319,7 @@ class ConversionService : Service() {
                         outputPath   = outputPath,
                         isCompleted  = true
                     )
+                    vibrateOnCompletion()
                     showCompletionNotification(outputPath, savedUri)
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
@@ -299,6 +340,258 @@ class ConversionService : Service() {
             },
             TransformationOptions.Builder().build()
         )
+    }
+
+    // ── Conversión a GIF ─────────────────────────────────────────────────────
+
+    private fun convertToGif(
+        inputUri: Uri,
+        outputPath: String,
+        startMs: Long,
+        durationMs: Long,
+        fps: Int,
+        targetWidth: Int,
+        loopCount: Int
+    ) {
+        val TAG = "ConversionService"
+        android.util.Log.i(TAG, "GIF: inicio uri=$inputUri startMs=$startMs durMs=$durationMs fps=$fps width=$targetWidth loop=$loopCount")
+
+        // ── 1. MediaExtractor: encontrar pista de video ──
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(applicationContext, inputUri, null)
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "GIF: no se puede abrir video", e)
+            _state.value = ConversionState(error = "No se puede acceder al video")
+            showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+            return
+        }
+
+        var trackIdx = -1
+        var trackFormat: MediaFormat? = null
+        for (i in 0 until extractor.trackCount) {
+            val fmt = extractor.getTrackFormat(i)
+            if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                trackIdx = i; trackFormat = fmt; break
+            }
+        }
+        if (trackIdx < 0 || trackFormat == null) {
+            android.util.Log.e(TAG, "GIF: no hay pista de video")
+            extractor.release()
+            _state.value = ConversionState(error = "No se encontró pista de video")
+            showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+            return
+        }
+        extractor.selectTrack(trackIdx)
+
+        val mime = trackFormat.getString(MediaFormat.KEY_MIME)!!
+        val videoW = trackFormat.getInteger(MediaFormat.KEY_WIDTH)
+        val videoH = trackFormat.getInteger(MediaFormat.KEY_HEIGHT)
+        val videoDurUs = if (trackFormat.containsKey(MediaFormat.KEY_DURATION))
+            trackFormat.getLong(MediaFormat.KEY_DURATION) else Long.MAX_VALUE
+        android.util.Log.i(TAG, "GIF: video ${videoW}x${videoH} mime=$mime dur=${videoDurUs/1000}ms")
+
+        // ── 2. Dimensiones del GIF ──
+        val scale = targetWidth.toFloat() / videoW
+        val gifW = targetWidth
+        val gifH = (videoH * scale).toInt().let { if (it % 2 != 0) it + 1 else it }
+
+        val startUs = startMs * 1000L
+        val endUs = ((startMs + durationMs) * 1000L).coerceAtMost(videoDurUs)
+        val frameIntervalUs = 1_000_000L / fps
+        val totalFrames = ((endUs - startUs) / frameIntervalUs).toInt().coerceAtLeast(1)
+        android.util.Log.i(TAG, "GIF: ${gifW}x${gifH} frames=$totalFrames interval=${frameIntervalUs}us range=[${startUs/1000}ms..${endUs/1000}ms]")
+
+        // ── 3. ImageReader + HandlerThread para capturar frames ──
+        val ht = android.os.HandlerThread("gif-reader").apply { start() }
+        val handler = android.os.Handler(ht.looper)
+        val frameSem = java.util.concurrent.Semaphore(0)
+        val imageReader = android.media.ImageReader.newInstance(
+            videoW, videoH, android.graphics.ImageFormat.YUV_420_888, 3
+        )
+        imageReader.setOnImageAvailableListener({ frameSem.release() }, handler)
+
+        // ── 4. MediaCodec decoder → Surface del ImageReader ──
+        val decoder = MediaCodec.createDecoderByType(mime)
+        decoder.configure(trackFormat, imageReader.surface, null, 0)
+        decoder.start()
+        android.util.Log.i(TAG, "GIF: decoder iniciado")
+
+        if (startMs > 0) {
+            extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+            android.util.Log.d(TAG, "GIF: seek a ${extractor.sampleTime/1000}ms (pedido ${startMs}ms)")
+        }
+
+        // ── 5. Encoder GIF ──
+        val outputFile = File(outputPath)
+        outputFile.parentFile?.mkdirs()
+        val fos = java.io.FileOutputStream(outputFile)
+
+        val gifEncoder = AnimatedGifEncoder()
+        gifEncoder.setSize(gifW, gifH)
+        gifEncoder.setRepeat(loopCount)
+        gifEncoder.setDelay(1000 / fps)
+        gifEncoder.setQuality(10)
+        gifEncoder.start(fos)
+
+        // ── 6. Bucle de decodificación ──
+        val bufInfo = MediaCodec.BufferInfo()
+        var inputDone = false
+        var outputDone = false
+        var framesEncoded = 0
+        var nextCaptureUs = startUs
+
+        while (!outputDone && !Thread.currentThread().isInterrupted) {
+            // Alimentar input buffers
+            if (!inputDone) {
+                val inIdx = decoder.dequeueInputBuffer(10_000)
+                if (inIdx >= 0) {
+                    val buf = decoder.getInputBuffer(inIdx)!!
+                    val size = extractor.readSampleData(buf, 0)
+                    if (size < 0) {
+                        decoder.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                        android.util.Log.d(TAG, "GIF: input EOS (extractor agotado)")
+                    } else {
+                        val pts = extractor.sampleTime
+                        decoder.queueInputBuffer(inIdx, 0, size, pts, 0)
+                        extractor.advance()
+                        if (pts > endUs) {
+                            val eosIdx = decoder.dequeueInputBuffer(10_000)
+                            if (eosIdx >= 0) {
+                                decoder.queueInputBuffer(eosIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            }
+                            inputDone = true
+                            android.util.Log.d(TAG, "GIF: input EOS (pts=${pts/1000}ms > end=${endUs/1000}ms)")
+                        }
+                    }
+                }
+            }
+
+            // Drenar output buffers
+            val outIdx = decoder.dequeueOutputBuffer(bufInfo, 10_000)
+            if (outIdx >= 0) {
+                val pts = bufInfo.presentationTimeUs
+                val eos = (bufInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                val wantCapture = pts >= nextCaptureUs && pts <= endUs && framesEncoded < totalFrames
+
+                if (wantCapture) {
+                    decoder.releaseOutputBuffer(outIdx, true) // render a Surface
+                    val got = frameSem.tryAcquire(2, java.util.concurrent.TimeUnit.SECONDS)
+                    if (got) {
+                        val image = imageReader.acquireLatestImage()
+                        if (image != null) {
+                            val bitmap = imageToArgbBitmap(image)
+                            image.close()
+                            val scaled = Bitmap.createScaledBitmap(bitmap, gifW, gifH, true)
+                            gifEncoder.addFrame(scaled)
+                            if (scaled !== bitmap) scaled.recycle()
+                            bitmap.recycle()
+                            framesEncoded++
+                            nextCaptureUs = startUs + framesEncoded.toLong() * frameIntervalUs
+                            val pct = (framesEncoded * 100 / totalFrames).coerceIn(1, 99)
+                            _state.value = _state.value.copy(progress = pct)
+                            updateProgressNotification(pct)
+                            android.util.Log.d(TAG, "GIF: frame $framesEncoded/$totalFrames pts=${pts/1000}ms")
+                        } else {
+                            android.util.Log.w(TAG, "GIF: acquireLatestImage null pts=${pts/1000}ms")
+                        }
+                    } else {
+                        android.util.Log.w(TAG, "GIF: semáforo timeout pts=${pts/1000}ms")
+                    }
+                } else {
+                    decoder.releaseOutputBuffer(outIdx, false)
+                }
+
+                if (eos || framesEncoded >= totalFrames) {
+                    outputDone = true
+                    android.util.Log.i(TAG, "GIF: output done eos=$eos frames=$framesEncoded")
+                }
+            } else if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                android.util.Log.d(TAG, "GIF: output format changed: ${decoder.outputFormat}")
+            }
+        }
+
+        // ── 7. Limpieza ──
+        decoder.stop()
+        decoder.release()
+        imageReader.close()
+        ht.quitSafely()
+        extractor.release()
+
+        gifEncoder.finish()
+        fos.close()
+
+        android.util.Log.i(TAG, "GIF: terminado. Frames=$framesEncoded Tamaño=${File(outputPath).length()} bytes")
+
+        if (framesEncoded < 2) {
+            outputFile.delete()
+            _state.value = ConversionState(error = "No se pudieron extraer suficientes frames")
+            showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
+            return
+        }
+
+        val savedUri = registerFileInMediaStore(outputPath, "gif")
+        _state.value = ConversionState(
+            isConverting = false,
+            progress     = 100,
+            outputPath   = outputPath,
+            isCompleted  = true
+        )
+        vibrateOnCompletion()
+        showCompletionNotification(outputPath, savedUri)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun imageToArgbBitmap(image: android.media.Image): Bitmap {
+        val w = image.width
+        val h = image.height
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+        val yBuf = yPlane.buffer
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+
+        // Convertir YUV_420_888 → NV21 para usar YuvImage
+        val nv21 = ByteArray(w * h * 3 / 2)
+        // Copiar Y
+        for (row in 0 until h) {
+            yBuf.position(row * yRowStride)
+            yBuf.get(nv21, row * w, w)
+        }
+        // Copiar VU intercalado (NV21 = Y + VU)
+        val uvH = h / 2
+        var nv21Offset = w * h
+        for (row in 0 until uvH) {
+            for (col in 0 until w / 2) {
+                val uvIdx = row * uvRowStride + col * uvPixelStride
+                nv21[nv21Offset++] = vBuf.get(uvIdx)   // V
+                nv21[nv21Offset++] = uBuf.get(uvIdx)   // U
+            }
+        }
+
+        val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, w, h, null)
+        val baos = java.io.ByteArrayOutputStream()
+        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, w, h), 90, baos)
+        return android.graphics.BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size())
+    }
+
+    // ── Vibración ─────────────────────────────────────────────────────────────
+
+    private fun vibrateOnCompletion() {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val mgr = getSystemService(VIBRATOR_MANAGER_SERVICE) as VibratorManager
+            mgr.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(VIBRATOR_SERVICE) as Vibrator
+        }
+        vibrator.vibrate(VibrationEffect.createOneShot(500, VibrationEffect.DEFAULT_AMPLITUDE))
     }
 
     // ── Notificaciones ────────────────────────────────────────────────────────
@@ -328,15 +621,15 @@ class ConversionService : Service() {
         nm.notify(NOTIF_PROGRESS_ID, buildProgressNotification(progress, _notifTitle))
     }
 
-    private fun showCompletionNotification(outputPath: String, videoUri: Uri?) {
+    private fun showCompletionNotification(outputPath: String, mediaUri: Uri?) {
         val fileName = outputPath.substringAfterLast('/')
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        val isGif = fileName.endsWith(".gif", ignoreCase = true)
 
-        // Si tenemos la URI del video en MediaStore, abrir directamente el reproductor.
-        // Si no, abrir la app principal como fallback.
-        val openIntent = if (videoUri != null) {
+        val openIntent = if (mediaUri != null) {
             Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(videoUri, "video/*")
+                val mime = if (isGif) "image/gif" else "video/*"
+                setDataAndType(mediaUri, mime)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
@@ -353,8 +646,8 @@ class ConversionService : Service() {
         nm.notify(
             NOTIF_COMPLETED_ID,
             NotificationCompat.Builder(this, CHANNEL_ALERT_ID)
-                .setContentTitle("✓ Conversión completada")
-                .setContentText("Toca para reproducir: $fileName")
+                .setContentTitle(if (isGif) "✓ GIF creado" else "✓ Conversión completada")
+                .setContentText("Toca para abrir: $fileName")
                 .setSmallIcon(android.R.drawable.stat_sys_download_done)
                 .setPriority(NotificationCompat.PRIORITY_DEFAULT)
                 .setAutoCancel(true)
@@ -380,26 +673,40 @@ class ConversionService : Service() {
     private fun registerFileInMediaStore(filePath: String, format: String): Uri? {
         val file = File(filePath)
         if (!file.exists()) return null
+        val isGif = format.lowercase() == "gif"
         val mimeType = when (format.lowercase()) {
+            "gif"  -> "image/gif"
             "webm" -> "video/webm"
             "3gp"  -> "video/3gpp"
             else   -> "video/mp4"
         }
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
-                put(MediaStore.Video.Media.MIME_TYPE, mimeType)
-                put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/VideoConvert")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
+                if (isGif) {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, file.name)
+                    put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+                    put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/VideoConvert")
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                } else {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
+                    put(MediaStore.Video.Media.MIME_TYPE, mimeType)
+                    put(MediaStore.Video.Media.RELATIVE_PATH, "${Environment.DIRECTORY_MOVIES}/VideoConvert")
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
             }
-            val uri = contentResolver.insert(
-                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL), values
-            ) ?: return null
+            val collection = if (isGif)
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            else
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            val uri = contentResolver.insert(collection, values) ?: return null
             try {
                 contentResolver.openOutputStream(uri)?.use { out ->
                     file.inputStream().use { it.copyTo(out) }
                 }
-                val upd = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                val upd = ContentValues().apply {
+                    if (isGif) put(MediaStore.Images.Media.IS_PENDING, 0)
+                    else put(MediaStore.Video.Media.IS_PENDING, 0)
+                }
                 contentResolver.update(uri, upd, null, null)
                 file.delete()
                 uri
@@ -408,15 +715,16 @@ class ConversionService : Service() {
                 null
             }
         } else {
+            val dirType = if (isGif) Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_MOVIES
             val dest = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                Environment.getExternalStoragePublicDirectory(dirType),
                 "VideoConvert/${file.name}"
             )
             dest.parentFile?.mkdirs()
             file.copyTo(dest, overwrite = true)
             file.delete()
             MediaScannerConnection.scanFile(this, arrayOf(dest.absolutePath), null, null)
-            null  // En API <29 no podemos obtener la URI de forma síncrona
+            null
         }
     }
 

@@ -9,10 +9,11 @@ import java.util.Locale
 
 object FileUtils {
 
-    /** Carpeta exclusiva de la app: /sdcard/Android/data/<pkg>/files/Movies/ */
-    fun getOutputDirectory(context: Context): File {
-        val dir = context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)
-            ?: File(context.filesDir, "Movies")
+    /** Carpeta exclusiva de la app: /sdcard/Android/data/<pkg>/files/Movies/ o Pictures/ para GIF */
+    fun getOutputDirectory(context: Context, format: String = "mp4"): File {
+        val dirType = if (format.lowercase() == "gif") Environment.DIRECTORY_PICTURES else Environment.DIRECTORY_MOVIES
+        val dir = context.getExternalFilesDir(dirType)
+            ?: File(context.filesDir, if (format.lowercase() == "gif") "Pictures" else "Movies")
         if (!dir.exists()) dir.mkdirs()
         return dir
     }
@@ -22,7 +23,7 @@ object FileUtils {
      * Si ya existe un archivo con ese nombre, añade un sufijo numérico.
      */
     fun buildOutputPath(context: Context, baseName: String, format: String): String {
-        val dir  = getOutputDirectory(context)
+        val dir  = getOutputDirectory(context, format)
         val name = baseName.trim().ifBlank { autoName() }
         var file = File(dir, "$name.$format")
         var counter = 1

@@ -8,8 +8,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.filled.SystemUpdateAlt
 import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.pullToRefresh
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -31,6 +36,9 @@ import com.andoni.convertidor.data.VideoRepository
 import com.andoni.convertidor.data.extension
 import com.andoni.convertidor.data.formattedDuration
 import com.andoni.convertidor.data.formattedSize
+import com.andoni.convertidor.util.AppUpdater
+import com.andoni.convertidor.util.UpdateInfo
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private enum class SortOrder(val label: String) {
@@ -49,8 +57,30 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
     var isLoading    by remember { mutableStateOf(true) }
     var sortOrder    by remember { mutableStateOf(SortOrder.DATE_DESC) }
     var showSortMenu by remember { mutableStateOf(false) }
+    var isRefreshing  by remember { mutableStateOf(false) }
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+    var showUpdateDialog by remember { mutableStateOf<UpdateInfo?>(null) }
+    val snackbarHostState = remember { SnackbarHostState() }
     val scope         = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
+
+    fun refreshVideos() {
+        scope.launch {
+            isRefreshing = true
+            snackbarHostState.currentSnackbarData?.dismiss()
+            launch {
+                snackbarHostState.showSnackbar(
+                    message = "Actualizando\u2026",
+                    duration = SnackbarDuration.Short
+                )
+            }
+            videos    = repository.getAllVideos()
+            isLoading = false
+            isRefreshing = false
+            delay(400)
+            snackbarHostState.currentSnackbarData?.dismiss()
+        }
+    }
 
     // Recargar videos cada vez que la pantalla vuelve al frente.
     // Esto cubre: carga inicial, retorno tras aceptar permisos y retorno desde otras pantallas.
@@ -77,9 +107,94 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
         }
     }
 
+    // ── Diálogo de actualización ──
+    showUpdateDialog?.let { update ->
+        AlertDialog(
+            onDismissRequest = { showUpdateDialog = null },
+            title = { Text("Nueva versión disponible") },
+            text = {
+                Column {
+                    Text("Versión ${update.versionName}")
+                    if (update.releaseNotes.isNotBlank()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            update.releaseNotes,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 8,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val ctx = context
+                    // Verificar permiso de instalar paquetes
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
+                        !ctx.packageManager.canRequestPackageInstalls()) {
+                        val intent = android.content.Intent(
+                            android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                            android.net.Uri.parse("package:${ctx.packageName}")
+                        )
+                        ctx.startActivity(intent)
+                    } else {
+                        AppUpdater.downloadAndInstall(ctx, update)
+                    }
+                    showUpdateDialog = null
+                }) { Text("Descargar e instalar") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdateDialog = null }) { Text("Ahora no") }
+            }
+        )
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
+                navigationIcon = {
+                    IconButton(
+                        onClick = {
+                            if (!isCheckingUpdate) {
+                                scope.launch {
+                                    isCheckingUpdate = true
+                                    snackbarHostState.currentSnackbarData?.dismiss()
+                                    launch {
+                                        snackbarHostState.showSnackbar(
+                                            message = "Buscando actualizaciones…",
+                                            duration = SnackbarDuration.Short
+                                        )
+                                    }
+                                    val update = AppUpdater.checkForUpdate(context)
+                                    isCheckingUpdate = false
+                                    delay(300)
+                                    snackbarHostState.currentSnackbarData?.dismiss()
+                                    if (update != null) {
+                                        showUpdateDialog = update
+                                    } else {
+                                        snackbarHostState.showSnackbar(
+                                            message = "Ya tienes la última versión",
+                                            duration = SnackbarDuration.Short
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    ) {
+                        if (isCheckingUpdate) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.dp
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.SystemUpdateAlt,
+                                contentDescription = "Buscar actualizaciones"
+                            )
+                        }
+                    }
+                },
                 title = {
                     Column {
                         Text("VideoConvert", fontWeight = FontWeight.Bold)
@@ -91,6 +206,9 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                     }
                 },
                 actions = {
+                    IconButton(onClick = { refreshVideos() }) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Recargar")
+                    }
                     Box {
                         IconButton(onClick = { showSortMenu = true }) {
                             Icon(Icons.Default.Sort, contentDescription = "Ordenar")
@@ -134,25 +252,36 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
             )
         }
     ) { padding ->
+        val pullState = rememberPullToRefreshState()
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
+                .pullToRefresh(
+                    isRefreshing = isRefreshing,
+                    state = pullState,
+                    onRefresh = { refreshVideos() }
+                )
         ) {
             when {
-                isLoading -> CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
+                isLoading && !isRefreshing -> Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) { CircularProgressIndicator() }
 
-                sortedVideos.isEmpty() -> Column(
-                    modifier = Modifier.align(Alignment.Center),
+                sortedVideos.isEmpty() && !isRefreshing -> Column(
+                    modifier = Modifier.fillMaxSize(),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    Spacer(Modifier.weight(1f))
                     Text("No se encontraron videos", style = MaterialTheme.typography.bodyLarge)
                     Text(
                         "Asegúrate de haber concedido el permiso de galería",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    Spacer(Modifier.weight(1f))
                 }
 
                 else -> LazyColumn(
@@ -165,6 +294,11 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                     }
                 }
             }
+            PullToRefreshDefaults.Indicator(
+                state = pullState,
+                isRefreshing = isRefreshing,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
         }
     }
 }
