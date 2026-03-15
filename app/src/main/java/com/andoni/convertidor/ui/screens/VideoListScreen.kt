@@ -66,6 +66,7 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
     var isRefreshing  by remember { mutableStateOf(false) }
     var isCheckingUpdate by remember { mutableStateOf(false) }
     var showUpdateDialog by remember { mutableStateOf<UpdateInfo?>(null) }
+    var pendingUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope         = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -108,6 +109,23 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // Si volvemos de Settings con permiso concedido y hay update pendiente, descargar
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                val pending = pendingUpdate
+                if (pending != null &&
+                    (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.O ||
+                     context.packageManager.canRequestPackageInstalls())) {
+                    pendingUpdate = null
+                    AppUpdater.downloadAndInstall(context, pending)
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     val sortedVideos = remember(videos, sortOrder) {
         when (sortOrder) {
             SortOrder.DATE_DESC -> videos.sortedByDescending { it.dateAdded }
@@ -139,9 +157,10 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     val ctx = context
-                    // Verificar permiso de instalar paquetes
                     if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O &&
                         !ctx.packageManager.canRequestPackageInstalls()) {
+                        // Guardar update pendiente y abrir Settings
+                        pendingUpdate = update
                         val intent = android.content.Intent(
                             android.provider.Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
                             android.net.Uri.parse("package:${ctx.packageName}")
