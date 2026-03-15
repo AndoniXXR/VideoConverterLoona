@@ -1,13 +1,19 @@
 ﻿package com.andoni.convertidor.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Sort
 import androidx.compose.material.icons.filled.SystemUpdateAlt
@@ -74,7 +80,9 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                     duration = SnackbarDuration.Short
                 )
             }
-            videos    = repository.getAllVideos()
+            try {
+                videos    = repository.getAllVideos()
+            } catch (_: Exception) { }
             isLoading = false
             isRefreshing = false
             delay(400)
@@ -89,7 +97,9 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
             if (event == Lifecycle.Event.ON_RESUME) {
                 scope.launch {
                     isLoading = true
-                    videos    = repository.getAllVideos()
+                    try {
+                        videos = repository.getAllVideos()
+                    } catch (_: Exception) { }
                     isLoading = false
                 }
             }
@@ -253,6 +263,10 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
         }
     ) { padding ->
         val pullState = rememberPullToRefreshState()
+        val listState = rememberLazyListState()
+        val showScrollToTop by remember {
+            derivedStateOf { listState.firstVisibleItemIndex > 3 }
+        }
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -285,6 +299,7 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                 }
 
                 else -> LazyColumn(
+                    state = listState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -299,6 +314,29 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                 isRefreshing = isRefreshing,
                 modifier = Modifier.align(Alignment.TopCenter)
             )
+
+            // Botón scroll-to-top semitransparente
+            AnimatedVisibility(
+                visible = showScrollToTop,
+                enter = fadeIn(),
+                exit = fadeOut(),
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 24.dp)
+            ) {
+                FloatingActionButton(
+                    onClick = { scope.launch { listState.animateScrollToItem(0) } },
+                    shape = CircleShape,
+                    containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.75f),
+                    contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    Icon(
+                        Icons.Default.KeyboardArrowUp,
+                        contentDescription = "Ir al inicio"
+                    )
+                }
+            }
         }
     }
 }

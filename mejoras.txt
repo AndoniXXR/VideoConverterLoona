@@ -1,0 +1,8 @@
+MEJORAS - Fix pantalla en blanco al volver del segundo plano
+=============================================================
+
+[X] 1. Envolver contenido en Surface(Modifier.fillMaxSize()) en Theme.kt o MainActivity.kt
+[X] 2. Añadir try/catch en la coroutine del lifecycle observer en VideoListScreen.kt
+[X] 3. Añadir try/catch en getAllVideos() en VideoRepository.kt
+[X] 4. Verificar permisos antes de cargar videos en VideoListScreen.kt
+[X] 5. Manejar el resultado del permission launcher en MainActivity.kt (actualmente vacio)

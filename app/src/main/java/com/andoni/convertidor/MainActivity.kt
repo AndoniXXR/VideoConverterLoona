@@ -33,6 +33,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppNavigation() {
     val navController = rememberNavController()
+    var permissionsGranted by remember { mutableStateOf(false) }
 
     // Permisos necesarios según versión de Android
     val permissions = remember {
@@ -48,7 +49,9 @@ fun AppNavigation() {
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* los resultados se gestionan a nivel de pantalla */ }
+    ) { results ->
+        permissionsGranted = results.values.any { it }
+    }
 
     // Solicitar permisos al iniciar la app
     LaunchedEffect(Unit) { permissionLauncher.launch(permissions) }
