@@ -69,6 +69,7 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
     var pendingUpdate by remember { mutableStateOf<UpdateInfo?>(null) }
     val snackbarHostState = remember { SnackbarHostState() }
     val scope         = rememberCoroutineScope()
+    val listState     = rememberLazyListState()
     val lifecycleOwner = LocalLifecycleOwner.current
 
     fun refreshVideos() {
@@ -86,6 +87,7 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
             } catch (_: Exception) { }
             isLoading = false
             isRefreshing = false
+            listState.animateScrollToItem(0)
             delay(400)
             snackbarHostState.currentSnackbarData?.dismiss()
         }
@@ -97,11 +99,15 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 scope.launch {
+                    val previousCount = videos.size
                     isLoading = true
                     try {
                         videos = repository.getAllVideos()
                     } catch (_: Exception) { }
                     isLoading = false
+                    if (videos.size != previousCount) {
+                        listState.animateScrollToItem(0)
+                    }
                 }
             }
         }
@@ -282,7 +288,6 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
         }
     ) { padding ->
         val pullState = rememberPullToRefreshState()
-        val listState = rememberLazyListState()
         val showScrollToTop by remember {
             derivedStateOf { listState.firstVisibleItemIndex > 3 }
         }
