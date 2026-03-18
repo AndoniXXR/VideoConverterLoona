@@ -116,6 +116,7 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                                 putExtra(ConversionService.EXTRA_FORMAT,        format)
                                 putExtra(ConversionService.EXTRA_IS_REPAIR,     isRepair)
                                 putExtra(ConversionService.EXTRA_DURATION_MS,   currentVideo.duration)
+                                putExtra(ConversionService.EXTRA_VIDEO_ID,      videoId)
                                 if (targetW   > 0) putExtra(ConversionService.EXTRA_TARGET_WIDTH,  targetW)
                                 if (targetH   > 0) putExtra(ConversionService.EXTRA_TARGET_HEIGHT, targetH)
                                 if (targetFps > 0) putExtra(ConversionService.EXTRA_TARGET_FPS,    targetFps)

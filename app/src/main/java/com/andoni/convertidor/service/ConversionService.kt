@@ -18,6 +18,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -54,6 +55,7 @@ class ConversionService : Service() {
         const val EXTRA_GIF_FPS         = "gif_fps"
         const val EXTRA_GIF_WIDTH       = "gif_width"
         const val EXTRA_GIF_LOOP_COUNT  = "gif_loop_count"
+        const val EXTRA_VIDEO_ID         = "video_id"
 
         const val CHANNEL_ID             = "conversion_channel"
         const val CHANNEL_ALERT_ID       = "conversion_alert_channel"
@@ -80,6 +82,8 @@ class ConversionService : Service() {
     private var transformer: MediaTransformer? = null
     private var currentRequestId: String? = null
     @Volatile private var interpolationThread: Thread? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var currentVideoId: Long = -1L
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -90,9 +94,23 @@ class ConversionService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        releaseWakeLock()
         interpolationThread?.interrupt()
         currentRequestId?.let { transformer?.cancel(it) }
         transformer?.release()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock == null) {
+            val pm = getSystemService(POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "VideoConvert::Conversion")
+            wakeLock?.acquire(4 * 60 * 60 * 1000L) // máx 4 horas
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -120,7 +138,14 @@ class ConversionService : Service() {
             else                                -> "Convirtiendo video…"
         }
         _notifTitle = notifTitle
-        startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0, notifTitle))
+        currentVideoId = intent?.getLongExtra(EXTRA_VIDEO_ID, -1L) ?: -1L
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0, notifTitle),
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        } else {
+            startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0, notifTitle))
+        }
+        acquireWakeLock()
         _state.value = ConversionState(isConverting = true, progress = 0)
 
         // Si es URI de contenido (content://) la usamos directamente.
@@ -157,6 +182,7 @@ class ConversionService : Service() {
                     android.util.Log.e("ConversionService", "GIF conversion failed", e)
                     _state.value = ConversionState(error = e.message ?: "Error al crear GIF")
                     showErrorNotification()
+                    releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -247,6 +273,7 @@ class ConversionService : Service() {
                             )
                             vibrateOnCompletion()
                             showCompletionNotification(capturedOutputPath, savedUri)
+                            releaseWakeLock()
                             stopForeground(STOP_FOREGROUND_REMOVE)
                             stopSelf()
                         } catch (e: Exception) {
@@ -321,12 +348,14 @@ class ConversionService : Service() {
                     )
                     vibrateOnCompletion()
                     showCompletionNotification(outputPath, savedUri)
+                    releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
                 override fun onCancelled(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
                     tempFile?.delete()
                     _state.value = ConversionState(error = "Conversión cancelada")
+                    releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -334,6 +363,7 @@ class ConversionService : Service() {
                     tempFile?.delete()
                     _state.value = ConversionState(error = cause?.message ?: "Error desconocido durante la conversión")
                     showErrorNotification()
+                    releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
@@ -363,6 +393,7 @@ class ConversionService : Service() {
         } catch (e: Exception) {
             android.util.Log.e(TAG, "GIF: no se puede abrir video", e)
             _state.value = ConversionState(error = "No se puede acceder al video")
+            releaseWakeLock()
             showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             return
         }
@@ -379,6 +410,7 @@ class ConversionService : Service() {
             android.util.Log.e(TAG, "GIF: no hay pista de video")
             extractor.release()
             _state.value = ConversionState(error = "No se encontró pista de video")
+            releaseWakeLock()
             showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             return
         }
@@ -527,6 +559,7 @@ class ConversionService : Service() {
         if (framesEncoded < 2) {
             outputFile.delete()
             _state.value = ConversionState(error = "No se pudieron extraer suficientes frames")
+            releaseWakeLock()
             showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             return
         }
@@ -540,6 +573,7 @@ class ConversionService : Service() {
         )
         vibrateOnCompletion()
         showCompletionNotification(outputPath, savedUri)
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -599,7 +633,10 @@ class ConversionService : Service() {
     private fun buildProgressNotification(progress: Int, title: String = "Convirtiendo video…"): Notification {
         val pi = PendingIntent.getActivity(
             this, 0,
-            Intent(this, MainActivity::class.java),
+            Intent(this, MainActivity::class.java).apply {
+                if (currentVideoId > 0) putExtra(EXTRA_VIDEO_ID, currentVideoId)
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            },
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val isIndeterminate = progress == 0
@@ -626,17 +663,9 @@ class ConversionService : Service() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val isGif = fileName.endsWith(".gif", ignoreCase = true)
 
-        val openIntent = if (mediaUri != null) {
-            Intent(Intent.ACTION_VIEW).apply {
-                val mime = if (isGif) "image/gif" else "video/*"
-                setDataAndType(mediaUri, mime)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        } else {
-            Intent(this, MainActivity::class.java).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            if (currentVideoId > 0) putExtra(EXTRA_VIDEO_ID, currentVideoId)
+            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         }
         val pi = PendingIntent.getActivity(
             this, NOTIF_COMPLETED_ID, openIntent,

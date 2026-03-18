@@ -1,5 +1,6 @@
 package com.andoni.convertidor
 
+import android.content.Intent
 import android.Manifest
 import android.os.Build
 import android.os.Bundle
@@ -17,23 +18,43 @@ import androidx.navigation.navArgument
 import com.andoni.convertidor.ui.screens.VideoDetailScreen
 import com.andoni.convertidor.ui.screens.VideoListScreen
 import com.andoni.convertidor.ui.theme.ConvertidorTheme
+import com.andoni.convertidor.service.ConversionService
 
 class MainActivity : ComponentActivity() {
+    private val _currentIntent = mutableStateOf<Intent?>(null)
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        _currentIntent.value = intent
         enableEdgeToEdge()
         setContent {
             ConvertidorTheme {
-                AppNavigation()
+                AppNavigation(_currentIntent.value)
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        _currentIntent.value = intent
     }
 }
 
 @Composable
-fun AppNavigation() {
+fun AppNavigation(activityIntent: Intent? = null) {
     val navController = rememberNavController()
     var permissionsGranted by remember { mutableStateOf(false) }
+
+    // Navegar al detalle si se abrió desde una notificación
+    LaunchedEffect(activityIntent) {
+        val videoId = activityIntent?.getLongExtra(ConversionService.EXTRA_VIDEO_ID, -1L) ?: -1L
+        if (videoId > 0) {
+            navController.navigate("video_detail/$videoId") {
+                launchSingleTop = true
+            }
+        }
+    }
 
     // Permisos necesarios según versión de Android
     val permissions = remember {
