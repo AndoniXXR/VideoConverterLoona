@@ -42,6 +42,7 @@ import com.andoni.convertidor.data.VideoRepository
 import com.andoni.convertidor.data.extension
 import com.andoni.convertidor.data.formattedDuration
 import com.andoni.convertidor.data.formattedSize
+import com.andoni.convertidor.service.ConversionService
 import com.andoni.convertidor.util.AppUpdater
 import com.andoni.convertidor.util.UpdateInfo
 import kotlinx.coroutines.delay
@@ -59,6 +60,7 @@ private enum class SortOrder(val label: String) {
 fun VideoListScreen(onVideoClick: (Long) -> Unit) {
     val context      = LocalContext.current
     val repository   = remember { VideoRepository(context) }
+    val convState    by ConversionService.state.collectAsState()
     var videos       by remember { mutableStateOf<List<VideoItem>>(emptyList()) }
     var isLoading    by remember { mutableStateOf(true) }
     var sortOrder    by remember { mutableStateOf(SortOrder.DATE_DESC) }
@@ -329,7 +331,11 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     items(sortedVideos, key = { it.id }) { video ->
-                        VideoListItem(video = video, onClick = { onVideoClick(video.id) })
+                        VideoListItem(
+                            video = video,
+                            onClick = { onVideoClick(video.id) },
+                            convState = convState
+                        )
                     }
                 }
             }
@@ -366,65 +372,94 @@ fun VideoListScreen(onVideoClick: (Long) -> Unit) {
 }
 
 @Composable
-private fun VideoListItem(video: VideoItem, onClick: () -> Unit) {
+private fun VideoListItem(
+    video: VideoItem,
+    onClick: () -> Unit,
+    convState: ConversionService.ConversionState
+) {
     val context = LocalContext.current
+    val isConverting = convState.isConverting && convState.videoId == video.id
     Card(
         modifier  = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
-        Row(
-            modifier  = Modifier.padding(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            // Miniatura del video
-            Box(
-                modifier = Modifier
-                    .size(88.dp, 66.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
-                contentAlignment = Alignment.Center
+        Column {
+            Row(
+                modifier  = Modifier.padding(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(video.uri)
-                        .decoderFactory(VideoFrameDecoder.Factory())
-                        .size(Size(176, 132))
-                        .crossfade(true)
-                        .build(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize()
-                )
-            }
-
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(5.dp)
-            ) {
-                Text(
-                    text       = video.name,
-                    style      = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                    maxLines   = 2,
-                    overflow   = TextOverflow.Ellipsis
-                )
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment     = Alignment.CenterVertically
+                // Miniatura del video
+                Box(
+                    modifier = Modifier
+                        .size(88.dp, 66.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant),
+                    contentAlignment = Alignment.Center
                 ) {
-                    FormatBadge(video.extension.uppercase().ifBlank { "?" })
+                    AsyncImage(
+                        model = ImageRequest.Builder(context)
+                            .data(video.uri)
+                            .decoderFactory(VideoFrameDecoder.Factory())
+                            .size(Size(176, 132))
+                            .crossfade(true)
+                            .build(),
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
                     Text(
-                        video.formattedDuration,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        text       = video.name,
+                        style      = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        maxLines   = 2,
+                        overflow   = TextOverflow.Ellipsis
+                    )
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment     = Alignment.CenterVertically
+                    ) {
+                        FormatBadge(video.extension.uppercase().ifBlank { "?" })
+                        Text(
+                            video.formattedDuration,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Text(
+                            video.formattedSize,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            // Barra de progreso de conversión
+            if (isConverting) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 10.dp)
+                        .padding(bottom = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    LinearProgressIndicator(
+                        progress = { convState.progress / 100f },
+                        modifier = Modifier.weight(1f)
                     )
                     Text(
-                        video.formattedSize,
+                        "${convState.progress}%",
                         style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.primary
                     )
                 }
             }

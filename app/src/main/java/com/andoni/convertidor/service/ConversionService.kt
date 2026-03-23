@@ -68,7 +68,9 @@ class ConversionService : Service() {
         val state = _state.asStateFlow()
 
         fun resetState() { _state.value = ConversionState() }
-        fun setStartingState() { _state.value = ConversionState(isConverting = true, progress = 0) }
+        fun setStartingState(videoId: Long = -1L) {
+            _state.value = ConversionState(isConverting = true, progress = 0, videoId = videoId)
+        }
     }
 
     data class ConversionState(
@@ -76,7 +78,8 @@ class ConversionService : Service() {
         val progress: Int = 0,
         val outputPath: String = "",
         val error: String? = null,
-        val isCompleted: Boolean = false
+        val isCompleted: Boolean = false,
+        val videoId: Long = -1L
     )
 
     private var transformer: MediaTransformer? = null
@@ -121,7 +124,7 @@ class ConversionService : Service() {
         val format      = intent?.getStringExtra(EXTRA_FORMAT)      ?: "mp4"
 
         if (inputUriStr.isNullOrBlank()) {
-            _state.value = ConversionState(error = "No se puede acceder al archivo de video")
+            _state.value = ConversionState(error = "No se puede acceder al archivo de video", videoId = currentVideoId)
             return stopAndReturn()
         }
 
@@ -146,7 +149,7 @@ class ConversionService : Service() {
             startForeground(NOTIF_PROGRESS_ID, buildProgressNotification(0, notifTitle))
         }
         acquireWakeLock()
-        _state.value = ConversionState(isConverting = true, progress = 0)
+        _state.value = ConversionState(isConverting = true, progress = 0, videoId = currentVideoId)
 
         // Si es URI de contenido (content://) la usamos directamente.
         // Si es ruta de archivo la convertimos a file://
@@ -180,7 +183,7 @@ class ConversionService : Service() {
                     convertToGif(inputUri, outputPath, gifStartMs, gifDurationMs, gifFps, gifWidth, gifLoopCount)
                 } catch (e: Exception) {
                     android.util.Log.e("ConversionService", "GIF conversion failed", e)
-                    _state.value = ConversionState(error = e.message ?: "Error al crear GIF")
+                    _state.value = ConversionState(error = e.message ?: "Error al crear GIF", videoId = currentVideoId)
                     showErrorNotification()
                     releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -269,7 +272,8 @@ class ConversionService : Service() {
                                 isConverting = false,
                                 progress     = 100,
                                 outputPath   = capturedOutputPath,
-                                isCompleted  = true
+                                isCompleted  = true,
+                                videoId      = currentVideoId
                             )
                             vibrateOnCompletion()
                             showCompletionNotification(capturedOutputPath, savedUri)
@@ -328,7 +332,7 @@ class ConversionService : Service() {
             audioFormat,
             object : TransformationListener {
                 override fun onStarted(id: String) {
-                    _state.value = ConversionState(isConverting = true, progress = 1)
+                    _state.value = ConversionState(isConverting = true, progress = 1, videoId = currentVideoId)
                 }
                 override fun onProgress(id: String, progress: Float) {
                     val base = if (hasPriorFps) 60 else 0
@@ -344,7 +348,8 @@ class ConversionService : Service() {
                         isConverting = false,
                         progress     = 100,
                         outputPath   = outputPath,
-                        isCompleted  = true
+                        isCompleted  = true,
+                        videoId      = currentVideoId
                     )
                     vibrateOnCompletion()
                     showCompletionNotification(outputPath, savedUri)
@@ -354,14 +359,14 @@ class ConversionService : Service() {
                 }
                 override fun onCancelled(id: String, trackTransformationInfos: List<TrackTransformationInfo>?) {
                     tempFile?.delete()
-                    _state.value = ConversionState(error = "Conversión cancelada")
+                    _state.value = ConversionState(error = "Conversión cancelada", videoId = currentVideoId)
                     releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
                 override fun onError(id: String, cause: Throwable?, trackTransformationInfos: List<TrackTransformationInfo>?) {
                     tempFile?.delete()
-                    _state.value = ConversionState(error = cause?.message ?: "Error desconocido durante la conversión")
+                    _state.value = ConversionState(error = cause?.message ?: "Error desconocido durante la conversión", videoId = currentVideoId)
                     showErrorNotification()
                     releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -392,7 +397,7 @@ class ConversionService : Service() {
             extractor.setDataSource(applicationContext, inputUri, null)
         } catch (e: Exception) {
             android.util.Log.e(TAG, "GIF: no se puede abrir video", e)
-            _state.value = ConversionState(error = "No se puede acceder al video")
+            _state.value = ConversionState(error = "No se puede acceder al video", videoId = currentVideoId)
             releaseWakeLock()
             showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             return
@@ -409,7 +414,7 @@ class ConversionService : Service() {
         if (trackIdx < 0 || trackFormat == null) {
             android.util.Log.e(TAG, "GIF: no hay pista de video")
             extractor.release()
-            _state.value = ConversionState(error = "No se encontró pista de video")
+            _state.value = ConversionState(error = "No se encontró pista de video", videoId = currentVideoId)
             releaseWakeLock()
             showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             return
@@ -558,7 +563,7 @@ class ConversionService : Service() {
 
         if (framesEncoded < 2) {
             outputFile.delete()
-            _state.value = ConversionState(error = "No se pudieron extraer suficientes frames")
+            _state.value = ConversionState(error = "No se pudieron extraer suficientes frames", videoId = currentVideoId)
             releaseWakeLock()
             showErrorNotification(); stopForeground(STOP_FOREGROUND_REMOVE); stopSelf()
             return
@@ -569,7 +574,8 @@ class ConversionService : Service() {
             isConverting = false,
             progress     = 100,
             outputPath   = outputPath,
-            isCompleted  = true
+            isCompleted  = true,
+            videoId      = currentVideoId
         )
         vibrateOnCompletion()
         showCompletionNotification(outputPath, savedUri)
@@ -584,35 +590,41 @@ class ConversionService : Service() {
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
-        val yBuf = yPlane.buffer
-        val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
+
         val yRowStride = yPlane.rowStride
         val uvRowStride = uPlane.rowStride
         val uvPixelStride = uPlane.pixelStride
 
-        // Convertir YUV_420_888 → NV21 para usar YuvImage
-        val nv21 = ByteArray(w * h * 3 / 2)
-        // Copiar Y
-        for (row in 0 until h) {
-            yBuf.position(row * yRowStride)
-            yBuf.get(nv21, row * w, w)
-        }
-        // Copiar VU intercalado (NV21 = Y + VU)
-        val uvH = h / 2
-        var nv21Offset = w * h
-        for (row in 0 until uvH) {
-            for (col in 0 until w / 2) {
-                val uvIdx = row * uvRowStride + col * uvPixelStride
-                nv21[nv21Offset++] = vBuf.get(uvIdx)   // V
-                nv21[nv21Offset++] = uBuf.get(uvIdx)   // U
+        // Leer datos de cada plano respetando los strides del dispositivo
+        val yBuf = yPlane.buffer
+        val uBuf = uPlane.buffer
+        val vBuf = vPlane.buffer
+
+        val yData = ByteArray(yBuf.remaining()).also { yBuf.get(it); yBuf.rewind() }
+        val uData = ByteArray(uBuf.remaining()).also { uBuf.get(it); uBuf.rewind() }
+        val vData = ByteArray(vBuf.remaining()).also { vBuf.get(it); vBuf.rewind() }
+
+        // Conversión YUV→RGB pixel a pixel, compatible con cualquier stride
+        val rgb = IntArray(w * h)
+        for (y in 0 until h) {
+            for (x in 0 until w) {
+                val yIdx = y * yRowStride + x
+                val uvIdx = (y / 2) * uvRowStride + (x / 2) * uvPixelStride
+
+                val yVal = (yData[yIdx].toInt() and 0xFF) - 16
+                val uVal = (uData[uvIdx].toInt() and 0xFF) - 128
+                val vVal = (vData[uvIdx].toInt() and 0xFF) - 128
+
+                // ITU-R BT.601
+                val r = (1.164 * yVal + 1.596 * vVal).toInt().coerceIn(0, 255)
+                val g = (1.164 * yVal - 0.813 * vVal - 0.391 * uVal).toInt().coerceIn(0, 255)
+                val b = (1.164 * yVal + 2.018 * uVal).toInt().coerceIn(0, 255)
+
+                rgb[y * w + x] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
 
-        val yuvImage = android.graphics.YuvImage(nv21, android.graphics.ImageFormat.NV21, w, h, null)
-        val baos = java.io.ByteArrayOutputStream()
-        yuvImage.compressToJpeg(android.graphics.Rect(0, 0, w, h), 90, baos)
-        return android.graphics.BitmapFactory.decodeByteArray(baos.toByteArray(), 0, baos.size())
+        return Bitmap.createBitmap(rgb, w, h, Bitmap.Config.ARGB_8888)
     }
 
     // ── Vibración ─────────────────────────────────────────────────────────────
@@ -663,14 +675,27 @@ class ConversionService : Service() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val isGif = fileName.endsWith(".gif", ignoreCase = true)
 
-        val openIntent = Intent(this, MainActivity::class.java).apply {
-            if (currentVideoId > 0) putExtra(EXTRA_VIDEO_ID, currentVideoId)
-            addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        val pi = if (isGif && mediaUri != null) {
+            // Para GIF: abrir en la galería/visor de imágenes del sistema
+            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(mediaUri, "image/gif")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            PendingIntent.getActivity(
+                this, NOTIF_COMPLETED_ID, viewIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+        } else {
+            // Para video: abrir la app en el detalle del video
+            val openIntent = Intent(this, MainActivity::class.java).apply {
+                if (currentVideoId > 0) putExtra(EXTRA_VIDEO_ID, currentVideoId)
+                addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            PendingIntent.getActivity(
+                this, NOTIF_COMPLETED_ID, openIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
         }
-        val pi = PendingIntent.getActivity(
-            this, NOTIF_COMPLETED_ID, openIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
 
         nm.notify(
             NOTIF_COMPLETED_ID,

@@ -2,6 +2,7 @@ package com.andoni.convertidor.ui.screens
 
 import android.content.Intent
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
@@ -54,25 +55,44 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
     val repository = remember { VideoRepository(context) }
     var video      by remember { mutableStateOf<VideoItem?>(null) }
     val convState  by ConversionService.state.collectAsState()
+    var hasNavigated by remember { mutableStateOf(false) }
+
+    val safeBack: () -> Unit = {
+        if (!hasNavigated) {
+            hasNavigated = true
+            onBack()
+        }
+    }
+
+    // Interceptar botón/gesto de retroceso del sistema
+    BackHandler(enabled = true) { safeBack() }
 
     LaunchedEffect(videoId) { video = repository.getVideoById(videoId) }
 
     // Volver al listado automáticamente tras conversión exitosa
     LaunchedEffect(convState.isCompleted) {
-        if (convState.isCompleted) {
+        if (convState.isCompleted && convState.videoId == videoId) {
             delay(800)
-            onBack()
+            safeBack()
         }
     }
 
-    DisposableEffect(Unit) { onDispose { ConversionService.resetState() } }
+    // Solo resetear el estado si la conversión ya terminó o si no pertenece a este video
+    DisposableEffect(Unit) {
+        onDispose {
+            val current = ConversionService.state.value
+            if (!current.isConverting || current.videoId != videoId) {
+                ConversionService.resetState()
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Detalle del video", maxLines = 1) },
                 navigationIcon = {
-                    IconButton(onClick = onBack) {
+                    IconButton(onClick = safeBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Atrás")
                     }
                 },
@@ -106,6 +126,7 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                     VideoInfoCard(currentVideo)
                     ConversionCard(
                         video       = currentVideo,
+                        videoId     = videoId,
                         convState   = convState,
                         scrollState = scrollState,
                         onExport    = { outputName, format, isRepair, targetW, targetH, targetFps, gifOpts ->
@@ -224,10 +245,14 @@ private fun formatEstimate(secs: Int): String = when {
 @Composable
 private fun ConversionCard(
     video:       VideoItem,
+    videoId:     Long,
     convState:   ConversionService.ConversionState,
     scrollState: ScrollState,
     onExport:    (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int, gifOpts: GifOptions?) -> Unit
 ) {
+    val isThisVideoConverting = convState.isConverting && convState.videoId == videoId
+    val isThisVideoCompleted  = convState.isCompleted && convState.videoId == videoId
+    val isThisVideoError      = convState.error != null && convState.videoId == videoId
     val allFormats = listOf("mp4", "webm", "3gp", "gif")
     var selectedFormat by remember {
         mutableStateOf(allFormats.firstOrNull { it != video.extension } ?: "mp4")
@@ -651,7 +676,7 @@ private fun ConversionCard(
             )
 
             // ── Progreso de conversión ──
-            if (convState.isConverting) {
+            if (isThisVideoConverting) {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -672,7 +697,7 @@ private fun ConversionCard(
             }
 
             // ── Mensaje de éxito ──
-            if (convState.isCompleted) {
+            if (isThisVideoCompleted) {
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.tertiaryContainer
@@ -688,14 +713,14 @@ private fun ConversionCard(
             }
 
             // ── Mensaje de error ──
-            convState.error?.let { err ->
+            if (isThisVideoError) {
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.errorContainer
                     )
                 ) {
                     Text(
-                        "Error: $err",
+                        "Error: ${convState.error}",
                         modifier = Modifier.padding(12.dp),
                         style    = MaterialTheme.typography.bodySmall,
                         color    = MaterialTheme.colorScheme.onErrorContainer,
@@ -732,7 +757,7 @@ private fun ConversionCard(
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
-                enabled  = !convState.isConverting &&
+                enabled  = !isThisVideoConverting &&
                            (!changeResolution || selectedPreset != null) &&
                            (!changeFps || selectedFps != null)
             ) {

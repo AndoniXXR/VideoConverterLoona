@@ -8,12 +8,21 @@ android {
     namespace = "com.andoni.convertidor"
     compileSdk = 35
 
+    signingConfigs {
+        create("release") {
+            storeFile = file("../release-keystore.jks")
+            storePassword = "LoonaConversor2026"
+            keyAlias = "release"
+            keyPassword = "LoonaConversor2026"
+        }
+    }
+
     defaultConfig {
         applicationId = "com.andoni.convertidor"
         minSdk = 26
         targetSdk = 35
-        versionCode = 17
-        versionName = "1.1.7"
+        versionCode = 18
+        versionName = "1.1.8"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables { useSupportLibrary = true }
     }
@@ -21,6 +30,7 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
