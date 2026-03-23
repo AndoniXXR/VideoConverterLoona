@@ -56,6 +56,7 @@ class ConversionService : Service() {
         const val EXTRA_GIF_WIDTH       = "gif_width"
         const val EXTRA_GIF_LOOP_COUNT  = "gif_loop_count"
         const val EXTRA_VIDEO_ID         = "video_id"
+        const val EXTRA_MUTE_AUDIO       = "mute_audio"
 
         const val CHANNEL_ID             = "conversion_channel"
         const val CHANNEL_ALERT_ID       = "conversion_alert_channel"
@@ -166,6 +167,7 @@ class ConversionService : Service() {
 
         val targetW = intent.getIntExtra(EXTRA_TARGET_WIDTH,  -1)
         val targetH = intent.getIntExtra(EXTRA_TARGET_HEIGHT, -1)
+        val muteAudio = intent.getBooleanExtra(EXTRA_MUTE_AUDIO, false)
 
         // ── Pipeline GIF ───────────────────────────────────────────────────
         if (format == "gif") {
@@ -226,6 +228,7 @@ class ConversionService : Service() {
             val capturedTargetH   = targetH
             val capturedFps       = targetFps
             val capturedRequestId = requestId
+            val capturedMuteAudio = muteAudio
 
             val thread = Thread {
                 val ok = try {
@@ -252,7 +255,7 @@ class ConversionService : Service() {
                 if (ok && tmpFile.exists()) {
                     // Mux: video interpolado + audio del original → archivo combinado
                     val combinedFile = File(cacheDir, "fps_combined_${System.currentTimeMillis()}.mp4")
-                    val muxOk = muxVideoWithOriginalAudio(tmpFile, capturedInputUri, combinedFile)
+                    val muxOk = muxVideoWithOriginalAudio(tmpFile, capturedInputUri, combinedFile, capturedMuteAudio)
                     tmpFile.delete()
 
                     if (muxOk && combinedFile.exists()) {
@@ -285,19 +288,19 @@ class ConversionService : Service() {
                             combinedFile.delete()
                             // Fallback: pasar original por LiTr
                             val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
-                            launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, audFmt, null,
+                            launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, if (capturedMuteAudio) null else audFmt, null,
                                 hasPriorFps = false, format = capturedFormat)
                         }
                     } else {
                         combinedFile.delete()
                         val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
-                        launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, audFmt, null,
+                        launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, if (capturedMuteAudio) null else audFmt, null,
                             hasPriorFps = false, format = capturedFormat)
                     }
                 } else {
                     tmpFile.delete()
                     val (vidFmt, audFmt) = buildTargetFormats(capturedInputUri, capturedFormat, capturedTargetW, capturedTargetH, capturedFps)
-                    launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, audFmt, null,
+                    launchLitr(capturedRequestId, capturedInputUri, capturedOutputPath, vidFmt, if (capturedMuteAudio) null else audFmt, null,
                         hasPriorFps = false, format = capturedFormat)
                 }
             }
@@ -309,7 +312,7 @@ class ConversionService : Service() {
         } else {
             // Sin interpolación de FPS: ir directamente a LiTr
             val (videoFmt, audioFmt) = buildTargetFormats(inputUri, format, targetW, targetH, targetFps)
-            launchLitr(requestId, inputUri, outputPath, videoFmt, audioFmt, null, format = format)
+            launchLitr(requestId, inputUri, outputPath, videoFmt, if (muteAudio) null else audioFmt, null, format = format)
         }
         return START_NOT_STICKY
     }
@@ -319,7 +322,7 @@ class ConversionService : Service() {
         inputUri:     Uri,
         outputPath:   String,
         videoFormat:  MediaFormat,
-        audioFormat:  MediaFormat,
+        audioFormat:  MediaFormat?,
         tempFile:     File?,
         hasPriorFps:  Boolean = false,
         format:       String  = "mp4"
@@ -439,20 +442,17 @@ class ConversionService : Service() {
         val totalFrames = ((endUs - startUs) / frameIntervalUs).toInt().coerceAtLeast(1)
         android.util.Log.i(TAG, "GIF: ${gifW}x${gifH} frames=$totalFrames interval=${frameIntervalUs}us range=[${startUs/1000}ms..${endUs/1000}ms]")
 
-        // ── 3. ImageReader + HandlerThread para capturar frames ──
-        val ht = android.os.HandlerThread("gif-reader").apply { start() }
-        val handler = android.os.Handler(ht.looper)
-        val frameSem = java.util.concurrent.Semaphore(0)
-        val imageReader = android.media.ImageReader.newInstance(
-            videoW, videoH, android.graphics.ImageFormat.YUV_420_888, 3
+        // ── 3. MediaCodec decoder en ByteBuffer mode (sin Surface/ImageReader) ──
+        // Evita crash nativo en Samsung (Exynos) donde ImageReader.getPlanes()
+        // provoca JNI abort por nullptr en NewDirectByteBuffer
+        trackFormat.setInteger(
+            MediaFormat.KEY_COLOR_FORMAT,
+            android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
         )
-        imageReader.setOnImageAvailableListener({ frameSem.release() }, handler)
-
-        // ── 4. MediaCodec decoder → Surface del ImageReader ──
         val decoder = MediaCodec.createDecoderByType(mime)
-        decoder.configure(trackFormat, imageReader.surface, null, 0)
+        decoder.configure(trackFormat, null, null, 0)  // null Surface = ByteBuffer mode
         decoder.start()
-        android.util.Log.i(TAG, "GIF: decoder iniciado")
+        android.util.Log.i(TAG, "GIF: decoder iniciado (ByteBuffer mode)")
 
         if (startMs > 0) {
             extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
@@ -513,32 +513,26 @@ class ConversionService : Service() {
                 val wantCapture = pts >= nextCaptureUs && pts <= endUs && framesEncoded < totalFrames
 
                 if (wantCapture) {
-                    decoder.releaseOutputBuffer(outIdx, true) // render a Surface
-                    val got = frameSem.tryAcquire(2, java.util.concurrent.TimeUnit.SECONDS)
-                    if (got) {
-                        val image = imageReader.acquireLatestImage()
-                        if (image != null) {
-                            val bitmap = imageToArgbBitmap(image)
-                            image.close()
-                            val scaled = Bitmap.createScaledBitmap(bitmap, gifW, gifH, true)
-                            gifEncoder.addFrame(scaled)
-                            if (scaled !== bitmap) scaled.recycle()
-                            bitmap.recycle()
-                            framesEncoded++
-                            nextCaptureUs = startUs + framesEncoded.toLong() * frameIntervalUs
-                            val pct = (framesEncoded * 100 / totalFrames).coerceIn(1, 99)
-                            _state.value = _state.value.copy(progress = pct)
-                            updateProgressNotification(pct)
-                            android.util.Log.d(TAG, "GIF: frame $framesEncoded/$totalFrames pts=${pts/1000}ms")
-                        } else {
-                            android.util.Log.w(TAG, "GIF: acquireLatestImage null pts=${pts/1000}ms")
-                        }
+                    // Leer frame directamente del codec buffer (ByteBuffer mode)
+                    val image = decoder.getOutputImage(outIdx)
+                    if (image != null) {
+                        val bitmap = imageToArgbBitmap(image)
+                        image.close()
+                        val scaled = Bitmap.createScaledBitmap(bitmap, gifW, gifH, true)
+                        gifEncoder.addFrame(scaled)
+                        if (scaled !== bitmap) scaled.recycle()
+                        bitmap.recycle()
+                        framesEncoded++
+                        nextCaptureUs = startUs + framesEncoded.toLong() * frameIntervalUs
+                        val pct = (framesEncoded * 100 / totalFrames).coerceIn(1, 99)
+                        _state.value = _state.value.copy(progress = pct)
+                        updateProgressNotification(pct)
+                        android.util.Log.d(TAG, "GIF: frame $framesEncoded/$totalFrames pts=${pts/1000}ms")
                     } else {
-                        android.util.Log.w(TAG, "GIF: semáforo timeout pts=${pts/1000}ms")
+                        android.util.Log.w(TAG, "GIF: getOutputImage null pts=${pts/1000}ms")
                     }
-                } else {
-                    decoder.releaseOutputBuffer(outIdx, false)
                 }
+                decoder.releaseOutputBuffer(outIdx, false)
 
                 if (eos || framesEncoded >= totalFrames) {
                     outputDone = true
@@ -552,8 +546,6 @@ class ConversionService : Service() {
         // ── 7. Limpieza ──
         decoder.stop()
         decoder.release()
-        imageReader.close()
-        ht.quitSafely()
         extractor.release()
 
         gifEncoder.finish()
@@ -675,10 +667,11 @@ class ConversionService : Service() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         val isGif = fileName.endsWith(".gif", ignoreCase = true)
 
-        val pi = if (isGif && mediaUri != null) {
-            // Para GIF: abrir en la galería/visor de imágenes del sistema
+        val pi = if (mediaUri != null) {
+            // Abrir el resultado en la galería/visor del sistema
+            val mimeType = if (isGif) "image/gif" else "video/*"
             val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(mediaUri, "image/gif")
+                setDataAndType(mediaUri, mimeType)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             PendingIntent.getActivity(
@@ -686,7 +679,7 @@ class ConversionService : Service() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
         } else {
-            // Para video: abrir la app en el detalle del video
+            // Fallback: abrir la app si no se pudo registrar en MediaStore
             val openIntent = Intent(this, MainActivity::class.java).apply {
                 if (currentVideoId > 0) putExtra(EXTRA_VIDEO_ID, currentVideoId)
                 addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
@@ -794,7 +787,8 @@ class ConversionService : Service() {
     private fun muxVideoWithOriginalAudio(
         videoFile: File,
         originalUri: Uri,
-        outputFile: File
+        outputFile: File,
+        muteAudio: Boolean = false
     ): Boolean {
         val videoExtractor = MediaExtractor()
         val audioExtractor = MediaExtractor()
@@ -812,16 +806,18 @@ class ConversionService : Service() {
             if (vidIdx < 0 || videoFormat == null) return false
             videoExtractor.selectTrack(vidIdx)
 
-            audioExtractor.setDataSource(applicationContext, originalUri, null)
-            var audioFormat: MediaFormat? = null
             var audIdx = -1
-            for (i in 0 until audioExtractor.trackCount) {
-                val fmt = audioExtractor.getTrackFormat(i)
-                if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
-                    audIdx = i; audioFormat = fmt; break
+            var audioFormat: MediaFormat? = null
+            if (!muteAudio) {
+                audioExtractor.setDataSource(applicationContext, originalUri, null)
+                for (i in 0 until audioExtractor.trackCount) {
+                    val fmt = audioExtractor.getTrackFormat(i)
+                    if (fmt.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                        audIdx = i; audioFormat = fmt; break
+                    }
                 }
+                if (audIdx >= 0) audioExtractor.selectTrack(audIdx)
             }
-            if (audIdx >= 0) audioExtractor.selectTrack(audIdx)
 
             outputFile.parentFile?.mkdirs()
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)

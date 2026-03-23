@@ -129,7 +129,7 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                         videoId     = videoId,
                         convState   = convState,
                         scrollState = scrollState,
-                        onExport    = { outputName, format, isRepair, targetW, targetH, targetFps, gifOpts ->
+                        onExport    = { outputName, format, isRepair, targetW, targetH, targetFps, gifOpts, muteAudio ->
                             val path = FileUtils.buildOutputPath(context, outputName, format)
                             val intent = Intent(context, ConversionService::class.java).apply {
                                 putExtra(ConversionService.EXTRA_INPUT_URI,     currentVideo.uri.toString())
@@ -138,6 +138,7 @@ fun VideoDetailScreen(videoId: Long, onBack: () -> Unit) {
                                 putExtra(ConversionService.EXTRA_IS_REPAIR,     isRepair)
                                 putExtra(ConversionService.EXTRA_DURATION_MS,   currentVideo.duration)
                                 putExtra(ConversionService.EXTRA_VIDEO_ID,      videoId)
+                                putExtra(ConversionService.EXTRA_MUTE_AUDIO,    muteAudio)
                                 if (targetW   > 0) putExtra(ConversionService.EXTRA_TARGET_WIDTH,  targetW)
                                 if (targetH   > 0) putExtra(ConversionService.EXTRA_TARGET_HEIGHT, targetH)
                                 if (targetFps > 0) putExtra(ConversionService.EXTRA_TARGET_FPS,    targetFps)
@@ -248,7 +249,7 @@ private fun ConversionCard(
     videoId:     Long,
     convState:   ConversionService.ConversionState,
     scrollState: ScrollState,
-    onExport:    (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int, gifOpts: GifOptions?) -> Unit
+    onExport:    (outputName: String, format: String, isRepair: Boolean, targetW: Int, targetH: Int, targetFps: Int, gifOpts: GifOptions?, muteAudio: Boolean) -> Unit
 ) {
     val isThisVideoConverting = convState.isConverting && convState.videoId == videoId
     val isThisVideoCompleted  = convState.isCompleted && convState.videoId == videoId
@@ -268,6 +269,9 @@ private fun ConversionCard(
         resolutionPresetsFor(video.width, video.height)
     }
     var selectedPreset by remember(presets) { mutableStateOf<ResolutionOption?>(null) }
+
+    // ── Silenciar audio ──
+    var muteAudio by remember { mutableStateOf(false) }
 
     // ── Ajuste de FPS ──
     var changeFps by remember { mutableStateOf(false) }
@@ -305,10 +309,10 @@ private fun ConversionCard(
                 width      = gifWidth,
                 loopCount  = gifLoopCount
             )
-            onExport(name, fmt, false, -1, -1, -1, opts)
+            onExport(name, fmt, false, -1, -1, -1, opts, false)
             return
         }
-        val hasAnyChange = (tW > 0 && tH > 0) || tFps > 0
+        val hasAnyChange = (tW > 0 && tH > 0) || tFps > 0 || muteAudio
         if (hasAnyChange) {
             pendingOutputName = name
             pendingFormat     = fmt
@@ -318,7 +322,7 @@ private fun ConversionCard(
             pendingTargetFps  = tFps
             showConfirmDialog = true
         } else {
-            onExport(name, fmt, repair, -1, -1, -1, null)
+            onExport(name, fmt, repair, -1, -1, -1, null, muteAudio)
         }
     }
 
@@ -653,6 +657,27 @@ private fun ConversionCard(
                     }
                 }
                 }
+
+                // ── Silenciar audio ──
+                HorizontalDivider()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("Silenciar audio",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium)
+                        Text("Elimina la pista de audio del video exportado",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    Checkbox(
+                        checked  = muteAudio,
+                        onCheckedChange = { muteAudio = it }
+                    )
+                }
             } // end else (FPS + Resolution sections)
 
             // ── Nombre del archivo de salida ──
@@ -742,14 +767,14 @@ private fun ConversionCard(
                 hasRes                         -> "Exportar a ${selectedPreset!!.label}"
                 hasFps                         -> "Exportar a ${tFps}fps"
                 else                           -> "Exportar a ${selectedFormat.uppercase()}"
-            }
+            } + if (muteAudio && selectedFormat != "gif") " · Sin audio" else ""
 
             Button(
                 onClick = {
                     focusManager.clearFocus()
                     if (selectedFormat == "gif") {
                         launchExport(outputName.trim(), "gif", false, -1, -1, -1)
-                    } else if (!isRepair && selectedFormat == video.extension && !hasRes && !hasFps) {
+                    } else if (!isRepair && selectedFormat == video.extension && !hasRes && !hasFps && !muteAudio) {
                         showSameFormatDialog = true
                     } else {
                         val fmt = if (isRepair) video.extension else selectedFormat
@@ -782,7 +807,7 @@ private fun ConversionCard(
                         Button(onClick = {
                             showSameFormatDialog = false
                             isRepair = true
-                            onExport(outputName.trim(), video.extension, true, -1, -1, -1, null)
+                            onExport(outputName.trim(), video.extension, true, -1, -1, -1, null, muteAudio)
                         }) { Text("Reparar video") }
                     },
                     dismissButton = {
@@ -847,7 +872,7 @@ private fun ConversionCard(
                         Button(onClick = {
                             showConfirmDialog = false
                             onExport(pendingOutputName, pendingFormat, pendingIsRepair,
-                                     pendingTargetW, pendingTargetH, pendingTargetFps, null)
+                                     pendingTargetW, pendingTargetH, pendingTargetFps, null, muteAudio)
                         }) { Text("Sí, continuar") }
                     },
                     dismissButton = {
